@@ -28,7 +28,7 @@ var (
 func qAlloc() url.Values { return qPool.Get().(url.Values) }
 func qFree(v url.Values) { clear(v); qPool.Put(v) }
 
-func (p *proxy) redurl(r *http.Request, si *meta.Snode, smapVer, now int64, netIntra, netPub string) (out string) {
+func (p *proxy) redurl(r *http.Request, si *meta.Snode, smapVer int64, netIntra, netPub string) (out string) {
 	var (
 		nodeURL string // dst node
 	)
@@ -54,37 +54,32 @@ func (p *proxy) redurl(r *http.Request, si *meta.Snode, smapVer, now int64, netI
 	}
 
 	var (
-		sign    *signer
-		enabled = cmn.Rom.SignVerifyEnabled()
+		sv      *svReq
+		sign    = p.svs.sign()
 		special = cmn.HasSpecialSymbols(r.URL.Path)
+		started = time.Now().UnixNano()
 	)
 	switch {
-	case enabled:
+	case sign:
 		// sign the redirect
 
 		sb := sbAlloc()
-		defer sbFree(sb) // computed sign.sig points into sb (to be recycled) but buildURL (below) clones it
+		defer sbFree(sb) // computed sv.sig points into sb (to be recycled) but buildURL (below) clones it
 
 		size := len(nodeURL) + len(r.URL.Path) + len(r.URL.RawQuery) + svOverheadURL // !special size; not optimizing
 		sb.Reset(size, true)
-		sign = &signer{
-			r:       r,
-			h:       &p.htrun,
-			sb:      sb,
-			smapVer: smapVer,
-			nonce:   p.sv.nonce.Add(1),
-		}
-		sign.sign(p.SID())
+		sv = newSigner(r, &p.htrun, sb, &p.svs, smapVer)
+		sv.sign(p.SID())
 
 		if !special {
 			// fast signing path
-			out = sign.buildURL(nodeURL, now)
+			out = sv.buildURL(nodeURL, started)
 			break
 		}
 		fallthrough
-	case !enabled && special:
+	case !sign && special:
 		scheme, host, q := _preparse(nodeURL, r)
-		raw := p.qencode(q, now, sign)
+		raw := p.qencode(q, started, sv)
 		u := url.URL{
 			Scheme:   scheme,
 			Host:     host,
@@ -95,7 +90,7 @@ func (p *proxy) redurl(r *http.Request, si *meta.Snode, smapVer, now int64, netI
 	default:
 		// fast path
 		q := qAlloc()
-		raw := p.qencode(q, now, nil)
+		raw := p.qencode(q, started, nil)
 		qFree(q)
 		if r.URL.RawQuery != "" {
 			return nodeURL + r.URL.Path + "?" + r.URL.RawQuery + "&" + raw
@@ -120,7 +115,6 @@ func _preparse(nodeURL string, r *http.Request) (scheme, host string, q url.Valu
 
 // http-redirect(with-json-message)
 func (p *proxy) redirectAction(w http.ResponseWriter, r *http.Request, bck *meta.Bck, objName string, msg *apc.ActMsg) {
-	started := time.Now()
 	smap := p.owner.smap.get()
 	si, err := smap.HrwName2T(bck.MakeUname(objName))
 	if err != nil {
@@ -131,6 +125,6 @@ func (p *proxy) redirectAction(w http.ResponseWriter, r *http.Request, bck *meta
 		nlog.Infoln(msg.Action, bck.Cname(objName), "=>", si.StringEx())
 	}
 
-	redurl := p.redurl(r, si, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	redurl := p.redurl(r, si, smap.Version, cmn.NetIntraControl, "")
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 }

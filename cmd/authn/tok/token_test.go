@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -266,6 +267,30 @@ func TestValidateToken_Expired(t *testing.T) {
 	tassert.Fatal(t, errors.Is(err, tok.ErrInvalidToken), "An expired token is invalid")
 }
 
+// Test that validating a correctly signed token without exp is rejected
+func TestValidateToken_NoExpiration(t *testing.T) {
+	c := newAdminClaims()
+	c.ExpiresAt = nil
+	tokenStr, err := hmacSigner.SignToken(c)
+	tassert.Fatalf(t, err == nil, "AdminJWT token generation failed: %v", err)
+	_, err = newHMACParser(t).ValidateToken(t.Context(), tokenStr)
+	tassert.Fatalf(t, err != nil, "Expected validating token without exp to fail, got %v", err)
+	tassert.Fatal(t, errors.Is(err, tok.ErrInvalidToken), "Expected invalid token error for missing exp")
+	tassert.Fatal(t, errors.Is(err, jwt.ErrTokenInvalidClaims), "Expected invalid claims error for missing exp")
+
+	hmacKeyProvider, err := tok.NewStaticKeyProvider(&cmn.AuthConf{
+		Signature: &cmn.AuthSignatureConf{
+			Method: "hmac",
+			Key:    testHMACSigningSecret,
+		},
+	})
+	tassert.CheckFatal(t, err)
+	_, err = tok.NewTokenParser(hmacKeyProvider, nil).ValidateToken(t.Context(), tokenStr)
+	tassert.Fatalf(t, err != nil, "Expected nil-config parser to reject token without exp, got %v", err)
+	tassert.Fatal(t, errors.Is(err, tok.ErrInvalidToken), "Expected invalid token error for missing exp (nil config)")
+	tassert.Fatal(t, errors.Is(err, jwt.ErrTokenInvalidClaims), "Expected invalid claims error for missing exp (nil config)")
+}
+
 func TestValidateToken_AudienceMismatch(t *testing.T) {
 	c := &tok.AISClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
@@ -338,6 +363,27 @@ func TestCheckPermissions_Granted(t *testing.T) {
 			tassert.Errorf(t, err == nil, "%s should be allowed, got: %v", perm.Describe(false), err)
 		})
 	}
+}
+
+// TestCheckPermissions_ObjectPermRequiresBucket verifies that an object-scoped
+// permission (e.g. apc.AceGET) is denied without a bucket but allowed against a
+// named bucket via a cluster-wide grant.
+func TestCheckPermissions_ObjectPermRequiresBucket(t *testing.T) {
+	const cluID = "cid1"
+	claims := newStandardClaims(nil, []*authn.CluACL{makeCluACL(apc.AccessRW, cluID)})
+	bck := &cmn.Bck{Name: "mybucket", Provider: apc.AIS}
+
+	t.Run("nil-bucket-rejected", func(t *testing.T) {
+		err := claims.CheckPermissions(cluID, nil, apc.AceGET)
+		tassert.Fatalf(t, err != nil, "expected nil-bucket AceGET to be denied")
+		tassert.Errorf(t, strings.Contains(err.Error(), "requested bucket permissions without a bucket"),
+			"expected the nil-bucket error, got: %v", err)
+	})
+
+	t.Run("named-bucket-allowed", func(t *testing.T) {
+		err := claims.CheckPermissions(cluID, bck, apc.AceGET)
+		tassert.Errorf(t, err == nil, "expected AceGET to be allowed with a real bucket, got: %v", err)
+	})
 }
 
 func TestValidateToken_IssLookup(t *testing.T) {

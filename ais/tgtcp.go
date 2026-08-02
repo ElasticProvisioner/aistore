@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -120,8 +121,30 @@ func (t *target) recvCluMeta(cm *cluMeta, action, sender string) error {
 	}
 }
 
+//
 // [METHOD] /v1/daemon
+//
+
 func (t *target) daemonHandler(w http.ResponseWriter, r *http.Request) {
+	t._dae(w, r, false /*isPub*/)
+}
+
+func (t *target) daePubHandler(w http.ResponseWriter, r *http.Request) {
+	t._dae(w, r, true /*isPub*/)
+}
+
+func (t *target) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
+	if isPub {
+		if r.Method != http.MethodGet {
+			t.writeErrStatusf(w, r, http.StatusForbidden, "%s: %s %s is read-only on %s", t, r.Method, r.URL.Path, cmn.NetPublic)
+			return
+		}
+	} else {
+		if !t.ensureIntraControl(w, r, false /* from primary */) {
+			return
+		}
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		t.httpdaeget(w, r)
@@ -240,15 +263,6 @@ func (t *target) daeputItems(w http.ResponseWriter, r *http.Request, apiItems []
 	case apc.Proxy:
 		// PUT /v1/daemon/proxy/newprimaryproxyid
 		t.daeSetPrimary(w, r, apiItems)
-	case apc.SyncSmap:
-		newsmap := &smapX{}
-		if cmn.ReadJSON(w, r, newsmap) != nil {
-			return
-		}
-		if err := t.owner.smap.synchronize(t.si, newsmap, nil /*ms payload*/, t.htrun.smapUpdatedCB); err != nil {
-			t.writeErr(w, r, cmn.NewErrFailedTo(t, "synchronize", newsmap, err))
-		}
-		nlog.Infof("%s: %s %s done", t, apc.SyncSmap, newsmap)
 	case apc.Mountpaths:
 		t.handleMpathReq(w, r)
 	case apc.ActSetConfig: // set-config #1 - via query parameters and "?n1=v1&n2=v2..."
@@ -1185,6 +1199,9 @@ func (t *target) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
+	if !t.ensureIntraControl(w, r, true /* from primary */) {
+		return
+	}
 	switch r.Method {
 	case http.MethodPut:
 		t.regstate.mu.Lock()
@@ -1350,7 +1367,11 @@ func (t *target) metasyncPost(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+//
 // GET /v1/health (apc.Health)
+//
+
+// pub-net: external watchdog and bootstrap cluster-info
 func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 	if t.regstate.disabled.Load() && daemon.cli.target.standby {
 		if cmn.Rom.V(4, cos.ModAIS) {
@@ -1360,50 +1381,100 @@ func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	if responded := t.externalWD(w, r); responded {
+
+	// Bootstrap/join callers may have no verifiable identity.
+	if r.URL.RawQuery != "" && cos.IsParseBool(r.URL.Query().Get(apc.QparamClusterInfo)) {
+		t.uptime2hdr(w.Header())
+
+		nsti := &cos.NodeStateInfo{}
+		t.fillNsti(nsti)
+		t.writeJSON(w, r, nsti, "cluster-info")
+		return
+	}
+
+	// External watchdog:
+	// - liveness: process is alive
+	// - readiness: node and cluster started and not in maintenance/decommission
+	isReadiness := strings.Contains(r.URL.RawQuery, apc.QparamHealthReady)
+	if cmn.Rom.V(5, cos.ModKalive) {
+		nlog.Infoln(t.String(), "external health-probe:", r.RemoteAddr,
+			isReadiness, "[", r.URL.RawQuery, "]")
+	}
+
+	if isReadiness && !t.isReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// intra-control: admission failure still reports target liveness;
+// only admitted peers may:
+// retrieve rebalance status, update heard-from, or trigger rebalance abort.
+//
+// note: periodic node-to-primary slow keepalive uses regTo => httpclupost
+// (not this endpoint)
+func (t *target) healthCtrlHandler(w http.ResponseWriter, r *http.Request) {
+	if t.regstate.disabled.Load() && daemon.cli.target.standby {
+		if cmn.Rom.V(4, cos.ModAIS) {
+			nlog.Warningln("[health]", t.String(), "standing by...")
+		}
+	} else if !t.NodeStarted() {
+		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
 	t.uptime2hdr(w.Header())
 
-	var (
-		getCii, getRebStatus bool
-	)
+	var getCii, getRebStatus bool
 	if r.URL.RawQuery != "" {
 		query := r.URL.Query()
 		getCii = cos.IsParseBool(query.Get(apc.QparamClusterInfo))
 		getRebStatus = cos.IsParseBool(query.Get(apc.QparamRebStatus))
 	}
 
-	// piggyback [cluster info]
+	// Bootstrap/join callers may have no verifiable identity.
 	if getCii {
 		nsti := &cos.NodeStateInfo{}
 		t.fillNsti(nsti)
 		t.writeJSON(w, r, nsti, "cluster-info")
 		return
 	}
-	// valid?
+
 	smap := t.owner.smap.get()
 	if !smap.isValid() {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
 
-	// return ok plus optional reb info
+	if _, err := t.checkIntra(r, false /*only primary*/); err != nil {
+		if cmn.Rom.V(4, cos.ModAIS) {
+			nlog.Warningln("[health]", t.String(),
+				"rejected intra-control request:", err)
+		}
+		w.WriteHeader(http.StatusOK) // liveness only
+		return
+	}
+
 	var (
 		err              error
 		senderID         = r.Header.Get(apc.HdrSenderID)
 		senderName       = r.Header.Get(apc.HdrSenderName)
-		senderSmapVer, _ = strconv.ParseInt(r.Header.Get(apc.HdrSenderSmapVer), 10, 64)
+		senderSmapVer, _ = strconv.ParseInt(
+			r.Header.Get(apc.HdrSenderSmapVer), 10, 64,
+		)
 	)
+
 	if smap.version() != senderSmapVer {
 		s := "older"
 		if smap.version() < senderSmapVer {
 			s = "newer"
 		}
-		err = fmt.Errorf("health-ping from (%s, %s) with %s Smap v%d", senderID, senderName, s, senderSmapVer)
+		err = fmt.Errorf("health-ping from (%s, %s) with %s Smap v%d",
+			senderID, senderName, s, senderSmapVer)
 		nlog.Warningf("%s[%s]: %v", t, smap.StringEx(), err)
 	}
+
 	if getRebStatus {
 		status := &reb.Status{}
 		t.reb.RebStatus(status)
@@ -1411,10 +1482,10 @@ func (t *target) healthHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if smap.version() < senderSmapVer && status.Running {
-			// NOTE: abort right away but don't broadcast
 			t.reb.AbortLocal(smap.version(), err)
 		}
 	}
+
 	if smap.GetProxy(senderID) != nil {
 		t.keepalive.heardFrom(senderID)
 	}
@@ -1445,7 +1516,7 @@ func (t *target) headt2t(lom *core.LOM, tsi *meta.Snode, smap *smapX, reqProps [
 		}
 		cargs.timeout = cmn.Rom.CplaneOperation()
 	}
-	res := t.call(cargs, smap)
+	res := t.call(cargs, smap) // note canonical h.call => setIntraHdrs path
 	freeCargs(cargs)
 
 	if err = res.err; err == nil && parseProps != "" {

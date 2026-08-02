@@ -1,7 +1,7 @@
 // Package volume provides volume (a.k.a. pool of disks) abstraction and methods to configure, store,
 // and validate the corresponding metadata. AIS volume is built on top of mountpaths (fs package).
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package volume
 
@@ -19,10 +19,9 @@ import (
 )
 
 type IniCtx struct {
-	NodeSigningKey *cos.NodeSigningKey
-	UseLoopbacks   bool // using loopback dev-s
-	IgnoreMissing  bool // ignore missing mountpath(s)
-	RandomTID      bool // generated random target ID
+	UseLoopbacks  bool // using loopback dev-s
+	IgnoreMissing bool // ignore missing mountpath(s)
+	RandomTID     bool // generated random target ID
 }
 
 // bootstrap from local-config referenced locations
@@ -39,7 +38,7 @@ func Init(t core.Target, config *cmn.Config, ctx IniCtx) bool /*created*/ {
 		fspaths = config.FSP.Paths.Keys()
 	)
 	// new and empty
-	blockDevs := fs.New(t, len(config.FSP.Paths), ctx.NodeSigningKey)
+	blockDevs := fs.New(t, len(config.FSP.Paths))
 
 	if v, err := configLoadVMD(tid, config.FSP.Paths); err != nil {
 		cos.ExitLogf("%s: %v (config-load-vmd, %v)", t, err, fspaths)

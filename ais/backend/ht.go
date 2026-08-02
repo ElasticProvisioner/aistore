@@ -2,7 +2,7 @@
 
 // Package backend contains core/backend interface implementations for supported backend providers.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package backend
 
@@ -86,7 +86,7 @@ func (htbp *htbp) HeadBucket(ctx context.Context, bck *meta.Bck) (cos.StrKVs, in
 	return bckProps, 0, nil
 }
 
-func (*htbp) ListObjects(*meta.Bck, *apc.LsoMsg, *cmn.LsoRes) (ecode int, err error) {
+func (*htbp) ListObjects(context.Context, *meta.Bck, *apc.LsoMsg, *cmn.LsoRes) (ecode int, err error) {
 	debug.Assert(false)
 	return
 }

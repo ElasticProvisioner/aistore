@@ -42,18 +42,6 @@ const unknownDaemonID = "unknown"
 
 const whatRenamedLB = "renamedlb"
 
-// common error formats
-const (
-	fmtErrInsuffMpaths1 = "%s: not enough mountpaths (%d) to configure %s as %d-way mirror"
-	fmtErrInsuffMpaths2 = "%s: not enough mountpaths (%d) to replicate %s (configured) %d times"
-	fmtErrInvaldAction  = "invalid action %q (expected one of %v)"
-	fmtUnknownQue       = "unexpected query [what=%s]"
-	fmtNested           = "%s: nested (%v): failed to %s %q: %v"
-	fmtOutside          = "%s is present (vs requested 'flt-outside'(%d))"
-	fmtFailedRejoin     = "%s failed to rejoin cluster: %v(%d)"
-	fmtSelfNotPresent   = "%s (self) not present in %s"
-)
-
 // intra-cluster control messages
 type (
 	// cluster-wide control information - replicated, versioned, and synchronized
@@ -169,135 +157,15 @@ type (
 		sync.Mutex
 		lowLatencyToS bool
 		useIPv6       bool
-		isSeparatePub bool // this netServer is facing users _and_ is not used for intra-cluster comm
+		reqNet        reqNet // enum { reqNetPub, ... }
 	}
 
 	nlogWriter struct{}
 )
 
-// error types
-type (
-	errTgtBmdUUIDDiffer struct{ detail string } // BMD & its uuid
-	errPrxBmdUUIDDiffer struct{ detail string }
-	errBmdUUIDSplit     struct{ detail string }
-	errSmapUUIDDiffer   struct{ detail string } // ditto Smap
-	errNodeNotFound     struct {
-		si   *meta.Snode // self
-		smap *smapX
-		msg  string
-		id   string
-	}
-	errSelfNotFound struct {
-		si   *meta.Snode
-		smap *smapX
-		act  string
-		tag  string
-	}
-	errNotEnoughTargets struct {
-		si       *meta.Snode
-		smap     *smapX
-		required int // should at least contain
-	}
-	errDowngrade struct {
-		si       *meta.Snode
-		from, to string
-	}
-	errNotPrimary struct {
-		si     *meta.Snode
-		smap   *smapX
-		detail string
-	}
-	errNoUnregister struct {
-		action string
-	}
-)
-
 var htverbs = [...]string{
 	http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
 	http.MethodDelete, http.MethodOptions, http.MethodTrace,
-}
-
-var (
-	errRebalanceDisabled = errors.New("rebalance is disabled")
-	errForwarded         = errors.New("forwarded")
-	errFastKalive        = errors.New("cannot fast-keepalive")
-	errIntraControl      = errors.New("expected intra-control request")
-)
-
-// BMD uuid errs
-var errNoBMD = errors.New("no bucket metadata")
-
-func (e *errTgtBmdUUIDDiffer) Error() string { return e.detail }
-func (e *errBmdUUIDSplit) Error() string     { return e.detail }
-func (e *errPrxBmdUUIDDiffer) Error() string { return e.detail }
-func (e *errSmapUUIDDiffer) Error() string   { return e.detail }
-func (e *errNodeNotFound) Error() string {
-	return fmt.Sprintf("%s: %s node %s not present in the %s", e.si, e.msg, e.id, e.smap)
-}
-func (e *errSelfNotFound) Error() string {
-	return fmt.Sprintf("%s: %s failure: not finding self in the %s %s", e.si, e.act, e.tag, e.smap.StringEx())
-}
-
-/////////////////////
-// errNoUnregister //
-/////////////////////
-
-func (e *errNoUnregister) Error() string { return e.action }
-
-func isErrNoUnregister(err error) (ok bool) {
-	_, ok = err.(*errNoUnregister)
-	return
-}
-
-//////////////////
-// errDowngrade //
-//////////////////
-
-func newErrDowngrade(si *meta.Snode, from, to string) *errDowngrade {
-	return &errDowngrade{si, from, to}
-}
-
-func (e *errDowngrade) Error() string {
-	return fmt.Sprintf("%s: attempt to downgrade %s to %s", e.si, e.from, e.to)
-}
-
-func isErrDowngrade(err error) bool {
-	if _, ok := err.(*errDowngrade); ok {
-		return true
-	}
-	var erd *errDowngrade
-	return errors.As(err, &erd)
-}
-
-/////////////////////////
-// errNotEnoughTargets //
-/////////////////////////
-
-func (e *errNotEnoughTargets) Error() string {
-	return fmt.Sprintf("%s: not enough targets: %s, need %d, have %d",
-		e.si, e.smap, e.required, e.smap.CountActiveTs())
-}
-
-///////////////////
-// errNotPrimary //
-///////////////////
-
-func newErrNotPrimary(si *meta.Snode, smap *smapX, detail ...string) *errNotPrimary {
-	if len(detail) == 0 {
-		return &errNotPrimary{si, smap, ""}
-	}
-	return &errNotPrimary{si, smap, detail[0]}
-}
-
-func (e *errNotPrimary) Error() string {
-	var present, detail string
-	if !e.smap.isPresent(e.si) {
-		present = "not present in the "
-	}
-	if e.detail != "" {
-		detail = ": " + e.detail
-	}
-	return fmt.Sprintf("%s is not primary [%s%s]%s", e.si, present, e.smap.StringEx(), detail)
 }
 
 ///////////////
@@ -500,35 +368,24 @@ func (*nlogWriter) Write(p []byte) (int, error) {
 // netServer //
 ///////////////
 
-// public handlers must reject intra-cluster sender headers;
-// bootstrap/public probes must stay intra-header free even when they are peer-to-peer calls within the same cluster
-func _yelp(hdr http.Header, name string) error {
-	if v := hdr.Get(name); v != "" {
-		return fmt.Errorf("unexpected intra-cluster header on pub: '%s=%s'", name, v)
-	}
-	return nil
-}
-
 // dispatch request to the handler with the closest matching URL
 func (server *netServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case !server.isSeparatePub:
-		// just dispatch
+	case server.reqNet != reqNetPub:
+		// intra-cluster listener
 		server.muxers._serveHTTP(w, r)
 
 	case r.Method == http.MethodPost && r.URL.Path == apc.URLPathCluAutoReg.S:
-		// self-join: remove intra-cluster headers, then dispatch
+		// self-join: remove intra-cluster headers
 		r.Header.Del(apc.HdrSenderID)
 		r.Header.Del(apc.HdrSenderName)
 		server.muxers._serveHTTP(w, r)
 
 	default:
-		// reject spoofed intra-cluster headers, if any
-		if err := _yelp(r.Header, apc.HdrSenderID); err != nil {
-			cmn.WriteErr(w, r, err, http.StatusForbidden)
-			return
-		}
-		if err := _yelp(r.Header, apc.HdrSenderName); err != nil {
+		// pub listener: reject spoofed intra-cluster header
+		// (and note: apc.HdrSenderName cannot stand alone)
+		if v := r.Header.Get(apc.HdrSenderID); v != "" {
+			err := fmt.Errorf("unexpected intra-cluster header on pub: '%s=%s'", apc.HdrSenderID, v)
 			cmn.WriteErr(w, r, err, http.StatusForbidden)
 			return
 		}
@@ -548,6 +405,9 @@ func (server *netServer) listen(addr string, logger *log.Logger, tlsConf *tls.Co
 		ErrorLog:          logger,
 		ReadHeaderTimeout: apc.ReadHeaderTimeout,
 		IdleTimeout:       dfltIdleTimeout,
+		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
+			return context.WithValue(ctx, keyReqNet, server.reqNet)
+		},
 	}
 	if timeout, isSet := cmn.ParseReadHeaderTimeout(); isSet { // optional env var
 		server.s.ReadHeaderTimeout = timeout
@@ -581,7 +441,7 @@ retry:
 	if config.Net.HTTP.UseHTTPS {
 		tag = "HTTPS"
 		// Listen and Serve TLS; certificates provided via tlsConf.GetCertificate()
-		// (ie., via certloader.GetCert())
+		// (ie., via CertLoader.GetCert())
 		err = server.s.ListenAndServeTLS("" /*certFile*/, "" /*keyFile*/)
 	} else {
 		err = server.s.ListenAndServe()
@@ -601,7 +461,7 @@ retry:
 	return err
 }
 
-func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
+func newTLS(conf *cmn.TLSConf, cl *certloader.CertLoader) (tlsConf *tls.Config, err error) {
 	var (
 		pool       *x509.CertPool
 		caCert     []byte
@@ -610,7 +470,7 @@ func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
 	tlsConf = &tls.Config{
 		ClientAuth: clientAuth,
 	}
-	if clientAuth > tls.RequestClientCert {
+	if clientAuth >= tls.VerifyClientCertIfGiven {
 		if caCert, err = os.ReadFile(conf.ClientCA); err != nil {
 			return nil, fmt.Errorf("new-tls: failed to read PEM %q, err: %w", conf.ClientCA, err)
 		}
@@ -629,9 +489,7 @@ func newTLS(conf *cmn.HTTPConf) (tlsConf *tls.Config, err error) {
 		}
 		tlsConf.ClientCAs = pool
 	}
-	if conf.Certificate != "" && conf.CertKey != "" {
-		tlsConf.GetCertificate, err = certloader.GetCert()
-	}
+	tlsConf.GetCertificate, err = cl.GetCert()
 	return tlsConf, err
 }
 

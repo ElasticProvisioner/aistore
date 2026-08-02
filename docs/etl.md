@@ -34,7 +34,7 @@ It supports both **inline transformations** (real-time processing via GET reques
   * [Using `init`](#using-init)
     * [Prerequisites](#prerequisites)
     * [Runtime Specification (Recommended)](#1-runtime-specification-recommended)
-    * [Kubernetes Pod Spec (Advanced Use)](#2-kubernetes-pod-spec-advanced-use)
+    * [Kubernetes Pod Spec (Deprecated)](#2-kubernetes-pod-spec-deprecated)
   * [Using `init_class` (Python SDK Only)](#using-init_class-python-sdk-only)
 * [Configuration Options](#configuration-options)
   * [Communication Mechanisms](#communication-mechanisms)
@@ -156,6 +156,39 @@ $ ais etl bucket ffmpeg-etl ais://libre-speech ais://libre-speech-transformed --
 $ ais ls ais://libre-speech-transformed | head -5
 ```
 
+### Object Inspection
+
+Object inspection applies an ETL to a bucket or object group without writing
+transformed results. It is useful for validation jobs where the ETL logic either
+accepts the object or raises an error. After the job completes, use ETL error
+reporting to see exactly which objects failed.
+
+Python SDK:
+
+```python
+from aistore.sdk.etl.webserver.fastapi_server import FastAPIServer
+
+etl = client.etl("validation-etl")
+
+@etl.init_class()
+class ValidationETL(FastAPIServer):
+    def transform(self, data: bytes, _path: str, _etl_args: str) -> bytes:
+        if data == b"invalid":
+            raise ValueError("validation failed")
+        return data
+
+job_id = bucket.objects(obj_names=["obj-1", "obj-2"]).inspect(etl_name=etl.name)
+errors = etl.view(job_id=job_id).obj_errors
+print(errors[0]) # obj_name='ais://test-bucket/obj-1' msg='ETL error: {"detail":"Processing error: validation failed"}'
+```
+
+Go API:
+
+```go
+xid, err := api.ETLInspectBucket(bp, bck, msg)
+xid, err := api.ETLInspectMultiObj(bp, bck, msg)
+```
+
 ### Single-Object Transformation
 
 Single-object Transformation allows you to transform one object at a time between any two buckets. It's similar to a regular copy operation, but with an ETL transformation applied in-flight. This is ideal for quick, ad-hoc conversions where creating an entire new bucket isn’t necessary.
@@ -214,7 +247,7 @@ These SDKs abstract the boilerplate and protocol handling, so you can focus pure
 
 ETL initialization in AIStore defines how your transformation logic is deployed, configured, and executed. This step launches a containerized ETL service that integrates with AIStore targets to handle object transformations.
 
-There are two primary ways to initialize an ETL using the `init` API—via a **runtime spec** or a **Kubernetes pod spec**. Additionally, for Python-only ETLs, a separate `init_class` approach is available through the Python SDK.
+The recommended way to initialize an ETL using the `init` API is via a **runtime spec**. Legacy **Kubernetes Pod spec** initialization remains available for backward compatibility but is deprecated. Additionally, for Python-only ETLs, a separate `init_class` approach is available through the Python SDK.
 
 ---
 
@@ -269,17 +302,17 @@ ais etl init --spec etl_spec.yaml
 
 ---
 
-#### 2. Kubernetes Pod Spec (Advanced Use)
+#### 2. Kubernetes Pod Spec (Deprecated)
 
-For advanced use cases, you can provide a full Kubernetes Pod specification. This method is useful if you need fine-grained control over pod behavior, health checks, init containers, or you’re not using the AIS ETL framework.
+> **DEPRECATED:** Full Kubernetes Pod spec initialization will be removed in AIStore v5.1. Migrate to the [runtime specification](#1-runtime-specification-recommended).
+
+Full Kubernetes Pod specs remain accepted only for backward compatibility with older AIS ETL transformers.
 
 ```bash
 curl -O https://raw.githubusercontent.com/NVIDIA/ais-etl/refs/heads/main/transformers/hello_world/pod.yaml
 # Review and edit the pod.yaml as needed
 ais etl init -f pod.yaml --name hello-world-etl
 ```
-
-This method is backward-compatible with old AIS ETL transformers and gives full control over deployment configuration.
 
 ---
 
@@ -321,7 +354,7 @@ print(obj.get_reader(etl=ETLConfig(etl_upper_case.name)).read_all())
 
 ## Configuration Options
 
-When initializing an ETL using the `init` API (via runtime spec or full Pod spec), several configuration parameters can be set to optimize behavior and performance. These options control how data is passed between AIStore targets and ETL containers, how responses are handled, and how the system reacts to delays or failures. Understanding and tuning these options allows users to better match ETL behavior to their specific workloads.
+When initializing an ETL using the `init` API, several configuration parameters can be set to optimize behavior and performance. These options control how data is passed between AIStore targets and ETL containers, how responses are handled, and how the system reacts to delays or failures. Understanding and tuning these options allows users to better match ETL behavior to their specific workloads.
 
 All the following options can be included in your ETL spec (YAML) during initialization.
 
@@ -476,10 +509,10 @@ and contain all necessary fields to start the Pod.
 | `metadata.annotations.support_direct_put` | `false` | Enable [direct put](#direct-put-optimization) optimization of an ETL. | - |
 | `spec.containers` | `true` | Containers running inside a Pod, exactly one required. | - |
 | `spec.containers[0].image` | `true` | Docker image of ETL container. | - |
-| `spec.containers[0].ports` | `true` (except `io://` communication type) | Ports exposed by a container, at least one expected. | - |
+| `spec.containers[0].ports` | `true` | Ports exposed by a container, at least one expected. | - |
 | `spec.containers[0].ports[0].Name` | `true` | Name of the first Pod should be `default`. | - |
 | `spec.containers[0].ports[0].containerPort` | `true` | Port which a cluster will contact containers on. | - |
-| `spec.containers[0].readinessProbe` | `true` (except `io://` communication type) | ReadinessProbe of a container. | - |
+| `spec.containers[0].readinessProbe` | `true` | ReadinessProbe of a container. | - |
 | `spec.containers[0].readinessProbe.timeoutSeconds` | `false` | Timeout for a readiness probe in seconds. | `5` |
 | `spec.containers[0].readinessProbe.periodSeconds` | `false` | Period between readiness probe requests in seconds. | `10` |
 | `spec.containers[0].readinessProbe.httpGet.Path` | `true` | Path for HTTP readiness probes. | - |

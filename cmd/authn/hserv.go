@@ -187,7 +187,8 @@ func (h *hserv) httpRevokeToken(w http.ResponseWriter, r *http.Request) {
 		cmn.WriteErrMsg(w, r, "empty token")
 		return
 	}
-	if _, err := h.mgr.validateToken(r.Context(), msg.Token); err != nil {
+	// signature-only: revoking an already-revoked token must remain idempotent
+	if _, err := h.mgr.validateTokenSignature(r.Context(), msg.Token); err != nil {
 		cmn.WriteErr(w, r, err, http.StatusUnauthorized)
 		return
 	}
@@ -519,6 +520,9 @@ func (h *hserv) httpRoleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, clu := range role.ClusterACLs {
+		if clu == nil {
+			continue
+		}
 		if cInfo, ok := clus[clu.ID]; ok {
 			clu.Alias = cInfo.Alias
 		}

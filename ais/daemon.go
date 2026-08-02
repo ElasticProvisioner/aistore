@@ -28,7 +28,6 @@ import (
 	"github.com/NVIDIA/aistore/space"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/tracing"
-	"github.com/NVIDIA/aistore/xact/xreg"
 	"github.com/NVIDIA/aistore/xact/xs"
 
 	"golang.org/x/sys/unix"
@@ -200,9 +199,6 @@ func initDaemon(version, buildTime string) cos.Runner {
 	// K8s
 	k8s.Init()
 
-	// declared xactions, as per xact/api.go
-	xreg.Init()
-
 	// primary 'host[:port]' endpoint or URL from the environment
 	if daemon.EP = os.Getenv(env.AisPrimaryEP); daemon.EP != "" {
 		scheme := "http"
@@ -243,7 +239,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 		// aux plumbing
 		nlog.SetTitle(title)
-		cmn.Init(p.si.Name(), nil)
+		cmn.Init(p.si.Name(), nil, p.toggleSignVerify)
 
 		// init distributed tracing
 		tracing.Init(config.Tracing, p.si, nil, version)
@@ -266,7 +262,7 @@ func initDaemon(version, buildTime string) cos.Runner {
 
 	// aux plumbing
 	nlog.SetTitle(title)
-	cmn.Init(t.si.Name(), fs.CleanPathErr)
+	cmn.Init(t.si.Name(), fs.CleanPathErr, t.toggleSignVerify)
 
 	// init distributed tracing
 	tracing.Init(config.Tracing, t.si, nil, version)

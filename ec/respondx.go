@@ -1,6 +1,6 @@
 // Package ec provides erasure coding (EC) based data protection for AIStore.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ec
 
@@ -59,12 +59,11 @@ func (p *rspFactory) WhenPrevIsRunning(xprev xreg.Renewable) (xreg.WPR, error) {
 	return xreg.WprUse, nil
 }
 
+// construct apc.ActECRespond xaction (EC manager runs it via _renewXact => xact.GoRunW)
 func (p *rspFactory) Start() error {
 	xec := ECM.NewRespondXact(p.Bck.Bucket())
 	xec.DemandBase.Init(cos.GenUUID(), p.Kind(), p.Bck, 0 /*use default*/)
 	p.xctn = xec
-
-	xact.GoRunW(xec)
 	return nil
 }
 

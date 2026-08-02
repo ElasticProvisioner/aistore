@@ -64,11 +64,9 @@ func (*nsummFactory) New(args xreg.Args, bck *meta.Bck) xreg.Renewable {
 	return p
 }
 
+// construction only (the renewal caller does xact.GoRunW)
 func (p *nsummFactory) Start() (err error) {
 	p.xctn, err = newSumm(p)
-	if err == nil {
-		xact.GoRunW(p.xctn)
-	}
 	return
 }
 
@@ -381,7 +379,7 @@ func (r *XactNsumm) runCloudBck(bck *meta.Bck, res *cmn.BsummResult) {
 		}
 		page = page[:0]
 
-		lst, err := npg.nextPageR(page)
+		lst, err := npg.nextPageR(r.Context(), page)
 		if err != nil {
 			r.AddErr(err)
 			return

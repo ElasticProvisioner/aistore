@@ -230,10 +230,6 @@ func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error)
 	{
 		reqArgs.Method = http.MethodGet
 		reqArgs.Base = params.Tsi.URL(cmn.NetIntraData)
-		reqArgs.Header = http.Header{
-			apc.HdrSenderID:   []string{t.SID()},
-			apc.HdrSenderName: []string{t.String()},
-		}
 		reqArgs.Path = apc.URLPathObjects.Join(lom.Bck().Name, lom.ObjName)
 		reqArgs.Query = query
 	}
@@ -243,6 +239,7 @@ func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error)
 		cmn.FreeHra(reqArgs)
 		return nil, err
 	}
+	t.setIntraHdrs(req)
 
 	var (
 		tout   = params.Timeout
@@ -284,4 +281,40 @@ func (t *target) GetFromNeighbor(params *core.GfnParams) (*http.Response, error)
 		OnClose: cancel,
 	}
 	return resp, nil
+}
+
+// send a signed intra-control POST to a peer; body is optional
+// (e.g., T2T control - see xact/t2tctrl.go)
+// compare with the method below that does only signing
+func (t *target) IntraCtrlPost(dst *meta.Snode, path string, body []byte) error {
+	cargs := allocCargs()
+	{
+		cargs.si = dst
+		cargs.timeout = cmn.Rom.MaxKeepalive()
+		cargs.req = cmn.HreqArgs{
+			Method: http.MethodPost,
+			Path:   path,
+			Body:   body,
+		}
+		if len(body) > 0 {
+			cargs.req.Header = http.Header{
+				cos.HdrContentType: []string{cos.ContentBinary},
+			}
+		}
+	}
+
+	res := t.call(cargs, t.owner.smap.get())
+	err := res.err
+
+	freeCR(res)
+	freeCargs(cargs)
+	return err
+}
+
+// Stamp an already-constructed request to a known intra-cluster peer with
+// sender identity and, when enabled, signature headers.
+func (t *target) setIntraHdrs(req *http.Request) {
+	smap := t.owner.smap.get()
+	debug.Assert(smap.isValid())
+	t.htrun.setIntraHdrs(req, smap, true /*peer is present in my Smap*/)
 }

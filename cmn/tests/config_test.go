@@ -5,6 +5,7 @@
 package tests_test
 
 import (
+	"crypto/tls"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/tools/tassert"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 var (
@@ -240,6 +243,8 @@ func TestGCOClone_NoAuthTracingAlias(t *testing.T) {
 	}
 	config.ClusterConfig.Auth.Signature = &cmn.AuthSignatureConf{Key: "k"}
 	config.ClusterConfig.Tracing = &cmn.TracingConf{Enabled: true, ExporterEndpoint: "x"}
+	config.ClusterConfig.Lso = &cmn.LsoConf{WalkBuffer: 256}
+
 	cmn.GCO.CommitUpdate(config)
 
 	c := cmn.GCO.Get()
@@ -253,6 +258,173 @@ func TestGCOClone_NoAuthTracingAlias(t *testing.T) {
 	}
 	if clone.Tracing == c.Tracing {
 		t.Fatal("Tracing alias")
+	}
+	// v5.0
+	if c.Net.HTTP.Pub != nil {
+		tassert.Fatalf(t, clone.Net.HTTP.Pub != c.Net.HTTP.Pub, "cloned Pub aliases source")
+	}
+	if clone.Lso == c.Lso {
+		t.Fatal("Lso alias")
+	}
+}
+
+func TestHTTPConfValidateTLS(t *testing.T) {
+	const (
+		crt = "crt.pem"
+		key = "key.pem"
+	)
+
+	tests := []struct {
+		name    string
+		http    cmn.HTTPConf
+		wantErr bool
+	}{
+		{name: "HTTPS without certs", http: cmn.HTTPConf{UseHTTPS: true}, wantErr: true},
+		{name: "HTTPS with certs", http: cmn.HTTPConf{UseHTTPS: true, TLSConf: cmn.TLSConf{Certificate: crt, CertKey: key}}},
+		{name: "HTTPS with crt only", http: cmn.HTTPConf{UseHTTPS: true, TLSConf: cmn.TLSConf{Certificate: crt}}, wantErr: true},
+		{name: "HTTPS with key only", http: cmn.HTTPConf{UseHTTPS: true, TLSConf: cmn.TLSConf{CertKey: key}}, wantErr: true},
+		{name: "not HTTPS (yet) with certs", http: cmn.HTTPConf{TLSConf: cmn.TLSConf{Certificate: crt, CertKey: key}}},
+		{name: "pub fully unset", http: cmn.HTTPConf{}},
+		{name: "pub auth knobs without certs", http: cmn.HTTPConf{Pub: &cmn.TLSConf{ClientAuthTLS: int(tls.RequireAndVerifyClientCert)}}, wantErr: true},
+		{name: "pub CA without certs", http: cmn.HTTPConf{Pub: &cmn.TLSConf{ClientCA: "ca.pem"}}, wantErr: true},
+		{name: "pub cert without key", http: cmn.HTTPConf{Pub: &cmn.TLSConf{Certificate: crt}}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.http.Validate()
+			if tt.wantErr {
+				tassert.Fatalf(t, err != nil, "expected error, got nil; http=%+v", tt.http)
+				return
+			}
+			tassert.CheckFatal(t, err)
+		})
+	}
+}
+
+func TestTLSConfValidate(t *testing.T) {
+	const (
+		crt = "crt.pem"
+		key = "key.pem"
+		ca  = "ca.pem"
+	)
+	tests := []struct {
+		name    string
+		tls     cmn.TLSConf
+		tag     string
+		wantErr bool
+	}{
+		{name: "empty", tag: "net.http"},
+		{name: "cert without key", tag: "net.http", tls: cmn.TLSConf{Certificate: crt}, wantErr: true},
+		{name: "key without cert", tag: "net.http", tls: cmn.TLSConf{CertKey: key}, wantErr: true},
+
+		// client_auth_tls <= RequireAnyClientCert(2): no verification, CA not required
+		// (existing client_auth_tls=2 deployments with empty client_ca_tls must survive upgrade)
+		{name: "request cert without CA", tag: "net.http", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: int(tls.RequestClientCert)}},
+		{name: "require-any without CA", tag: "net.http.pub", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: int(tls.RequireAnyClientCert)}},
+
+		// client_auth_tls >= VerifyClientCertIfGiven(3): verification, CA required
+		{name: "verify-if-given without CA", tag: "net.http", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: int(tls.VerifyClientCertIfGiven)}, wantErr: true},
+		{name: "require-and-verify without CA", tag: "net.http.pub", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: int(tls.RequireAndVerifyClientCert)}, wantErr: true},
+		{name: "require-and-verify with CA", tag: "net.http.pub", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientCA: ca, ClientAuthTLS: int(tls.RequireAndVerifyClientCert)}},
+
+		{name: "client_auth_tls out of range (negative)", tag: "net.http", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: -1}, wantErr: true},
+		{name: "client_auth_tls out of range (high)", tag: "net.http", tls: cmn.TLSConf{Certificate: crt, CertKey: key, ClientAuthTLS: int(tls.RequireAndVerifyClientCert) + 1}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.tls.Validate(tt.tag)
+			if tt.wantErr {
+				tassert.Fatalf(t, err != nil, "expected error, got nil; tls=%+v", tt.tls)
+				return
+			}
+			tassert.CheckFatal(t, err)
+		})
+	}
+}
+
+func TestHTTPConfIterFieldsPubTLSPaths(t *testing.T) {
+	http := cmn.HTTPConf{
+		TLSConf: cmn.TLSConf{Certificate: "main.crt", CertKey: "main.key"},
+		Pub:     &cmn.TLSConf{Certificate: "pub.crt", CertKey: "pub.key"},
+	}
+	want := map[string]any{
+		"server_crt":     "main.crt",
+		"server_key":     "main.key",
+		"pub.server_crt": "pub.crt",
+		"pub.server_key": "pub.key",
+	}
+
+	got := make(map[string]any)
+	err := cmn.IterFields(http, func(tag string, field cmn.IterField) (error, bool) {
+		got[tag] = field.Value()
+		return nil, false
+	})
+	tassert.CheckFatal(t, err)
+	for tag, wantVal := range want {
+		tassert.Errorf(t, got[tag] == wantVal, "%s = %v, want %v", tag, got[tag], wantVal)
+	}
+}
+
+func TestHTTPConfCopyPropsPubTLS(t *testing.T) {
+	mainCrt, mainKey := "main.crt", "main.key"
+	pubCrt, pubKey := "pub.crt", "pub.key"
+
+	src := cmn.HTTPConfToSet{
+		TLSConfToSet: &cmn.TLSConfToSet{
+			Certificate: &mainCrt,
+			CertKey:     &mainKey,
+		},
+		Pub: &cmn.TLSConfToSet{
+			Certificate: &pubCrt,
+			CertKey:     &pubKey,
+		},
+	}
+	tests := []struct {
+		name string
+		pub  *cmn.TLSConf
+	}{
+		{name: "create pub"},
+		{
+			name: "update pub",
+			pub:  &cmn.TLSConf{Certificate: "old-pub.crt", CertKey: "old-pub.key"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dst := cmn.HTTPConf{
+				TLSConf: cmn.TLSConf{
+					Certificate: "old.crt",
+					CertKey:     "old.key",
+				},
+				Pub: tt.pub,
+			}
+
+			tassert.CheckFatal(t, cmn.CopyProps(src, &dst, apc.Cluster))
+			tassert.Errorf(t, dst.Certificate == mainCrt, "main cert = %q, want %q", dst.Certificate, mainCrt)
+			tassert.Errorf(t, dst.CertKey == mainKey, "main key = %q, want %q", dst.CertKey, mainKey)
+
+			tassert.Fatalf(t, dst.Pub != nil, "expected pub TLS config to be allocated")
+			tassert.Errorf(t, dst.Pub.Certificate == pubCrt, "pub cert = %q, want %q", dst.Pub.Certificate, pubCrt)
+			tassert.Errorf(t, dst.Pub.CertKey == pubKey, "pub key = %q, want %q", dst.Pub.CertKey, pubKey)
+		})
+	}
+}
+
+func TestTLSConfEnabled(t *testing.T) {
+	tests := []struct {
+		name string
+		tls  *cmn.TLSConf
+		want bool
+	}{
+		{name: "empty", tls: &cmn.TLSConf{}, want: false},
+		{name: "cert only", tls: &cmn.TLSConf{Certificate: "crt.pem"}, want: false},
+		{name: "key only", tls: &cmn.TLSConf{CertKey: "key.pem"}, want: false},
+		{name: "cert and key", tls: &cmn.TLSConf{Certificate: "crt.pem", CertKey: "key.pem"}, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tassert.Errorf(t, tt.tls.Enabled() == tt.want, "Enabled() = %v, want %v", tt.tls.Enabled(), tt.want)
+		})
 	}
 }
 
@@ -392,4 +564,15 @@ func TestLocalNetConfigValidate_OverlappingDataHostAndPort(t *testing.T) {
 			tassert.Fatalf(t, err != nil, "expected error when data hostname and port overlap, got nil")
 		})
 	}
+}
+
+// expecting TLSConf inline
+func TestHTTPConfJSONFlat(t *testing.T) {
+	legacy := []byte(`{"server_crt":"c.pem","server_key":"k.pem","client_ca_tls":"ca.pem","client_auth_tls":4,"use_https":true}`)
+	var c cmn.HTTPConf
+	tassert.CheckFatal(t, jsoniter.Unmarshal(legacy, &c))
+	tassert.Fatalf(t, c.Certificate == "c.pem" && c.CertKey == "k.pem" && c.ClientCA == "ca.pem" && c.ClientAuthTLS == 4 && c.UseHTTPS,
+		"promotion broken: %+v", c)
+	b, _ := jsoniter.Marshal(c)
+	tassert.Fatalf(t, !strings.Contains(string(b), `"tls"`), "unexpected nesting: %s", b)
 }

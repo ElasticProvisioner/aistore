@@ -52,7 +52,7 @@ The validation occurs both at the cluster level and when setting bucket properti
 
 | name | tags | comment |
 | --- | --- | ------- |
-| `Enforce-IntraCluster-Access` | `security` | when enabled, aistore targets will make sure _not_ to execute direct (ie., not redirected) API calls |
+| `Enforce-IntraCluster-Access` | `security` | Deprecated: use auth.intra_cluster to secure intra-cluster communications |
 | `Skip-Loading-VersionChecksum-MD(*)` | `perf,integrity-` | skip loading existing object's metadata, Version and Checksum (VC) in particular |
 | `Do-not-Auto-Detect-FileShare` | `promote,ops` | do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS |
 | `S3-API-via-Root` | `s3,compat,ops` | handle S3 requests via `aistore-hostname/` (whereby the default: `aistore-hostname/s3`) |
@@ -79,22 +79,23 @@ The validation occurs both at the cluster level and when setting bucket properti
 | `Count-Object-NotFound-Stats` | `telemetry,ops` | count GET(object) 404 as errors (default: don't) |
 | `Enable-Go-Runtime-Metrics` | `telemetry,ops,overhead` | publish a low-cardinality subset of Go runtime metrics (goroutines, GC, heap) via Prometheus |
 | `Dload-Allow-Private-Egress` | `security-` | allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked |
+| `S3-Redirect-Rebuild` | `s3,compat,security-` | allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured) |
 
 ## Global features
 
 ```console
 $ ais config cluster features <TAB-TAB>
 
-Enforce-IntraCluster-Access            S3-Presigned-Request                   S3-ListObjectVersions
-Skip-Loading-VersionChecksum-MD        Do-not-Optimize-Listing-Virtual-Dirs   Enable-Detailed-Prom-Metrics
-Do-not-Auto-Detect-FileShare           Disable-Cold-GET                       Force-Container-CPU-Mem
-S3-API-via-Root                        Streaming-Cold-GET                     Resume-Interrupted-MPU
-Fsync-PUT                              S3-Reverse-Proxy                       Keep-Unknown-FQN
-LZ4-Block-1MB                          S3-Use-Path-Style                      Load-Balance-GET
-LZ4-Frame-Checksum                     Do-not-Delete-When-Rebalancing         Count-Object-NotFound-Stats
-Do-not-Allow-Passing-FQN-to-ETL        Do-not-Set-Control-Plane-ToS           Enable-Go-Runtime-Metrics
-Ignore-LimitedCoexistence-Conflicts    Trust-Crypto-Safe-Checksums            Dload-Allow-Private-Egress
-none
+Enforce-IntraCluster-Access            Do-not-Optimize-Listing-Virtual-Dirs   Force-Container-CPU-Mem
+Skip-Loading-VersionChecksum-MD        Disable-Cold-GET                       Resume-Interrupted-MPU
+Do-not-Auto-Detect-FileShare           Streaming-Cold-GET                     Keep-Unknown-FQN
+S3-API-via-Root                        S3-Reverse-Proxy                       Load-Balance-GET
+Fsync-PUT                              S3-Use-Path-Style                      Count-Object-NotFound-Stats
+LZ4-Block-1MB                          Do-not-Delete-When-Rebalancing         Enable-Go-Runtime-Metrics
+LZ4-Frame-Checksum                     Do-not-Set-Control-Plane-ToS           Dload-Allow-Private-Egress
+Do-not-Allow-Passing-FQN-to-ETL        Trust-Crypto-Safe-Checksums            S3-Redirect-Rebuild
+Ignore-LimitedCoexistence-Conflicts    S3-ListObjectVersions                  none
+S3-Presigned-Request                   Enable-Detailed-Prom-Metrics
 ```
 
 For example:
@@ -107,8 +108,8 @@ features         Skip-Loading-VersionChecksum-MD
                  S3-API-via-Root
                  Load-Balance-GET
 
-FEATURE                              TAGS                    DESCRIPTION
-Enforce-IntraCluster-Access          security               enforce intra-cluster access
+FEATURE                              TAGS                   DESCRIPTION
+Enforce-IntraCluster-Access          security               Deprecated: use auth.intra_cluster to secure intra-cluster communications
 Skip-Loading-VersionChecksum-MD      perf,integrity-        (*) skip loading existing object's metadata, Version and Checksum (VC) in particular              <<< colored
 Do-not-Auto-Detect-FileShare         promote,ops            do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 S3-API-via-Root                      s3,compat,ops          handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)                       <<< colored
@@ -135,6 +136,7 @@ Load-Balance-GET                     perf                   when bucket is n-way
 Count-Object-NotFound-Stats          telemetry,ops          count GET(object) 404 as errors
 Enable-Go-Runtime-Metrics            telemetry,ops,overhead publish selected Go runtime metrics via Prometheus
 Dload-Allow-Private-Egress           security-              allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked
+S3-Redirect-Rebuild                  s3,compat,security-    allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)
 
 Cluster config updated
 ```
@@ -153,8 +155,8 @@ features         Skip-Loading-VersionChecksum-MD
                  S3-API-via-Root
                  Load-Balance-GET
 
-FEATURE                              TAGS                    DESCRIPTION
-Enforce-IntraCluster-Access          security               enforce intra-cluster access
+FEATURE                              TAGS                   DESCRIPTION
+Enforce-IntraCluster-Access          security               Deprecated: use auth.intra_cluster to secure intra-cluster communications
 Skip-Loading-VersionChecksum-MD      perf,integrity-        (*) skip loading existing object's metadata, Version and Checksum (VC) in particular               <<< colored
 Do-not-Auto-Detect-FileShare         promote,ops            do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 S3-API-via-Root                      s3,compat,ops          handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)                        <<< colored
@@ -181,6 +183,7 @@ Load-Balance-GET                     perf                   when bucket is n-way
 Count-Object-NotFound-Stats          telemetry,ops          count GET(object) 404 as errors
 Enable-Go-Runtime-Metrics            telemetry,ops,overhead publish selected Go runtime metrics via Prometheus
 Dload-Allow-Private-Egress           security-              allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked
+S3-Redirect-Rebuild                  s3,compat,security-    allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)
 ```
 
 The same in JSON:

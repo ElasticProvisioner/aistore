@@ -1,4 +1,4 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
@@ -6,6 +6,7 @@ package ais
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -73,7 +74,7 @@ func newPrimary(t *testing.T) *proxy {
 		smap    = newSmap()
 	)
 
-	p.owner.smap = newSmapOwner(cmn.GCO.Get())
+	p.owner.smap = newSmapOwner(cmn.GCO.Get(), false /*isTarget*/)
 	p.si = newSnode("primary", apc.Proxy, meta.NetInfo{}, meta.NetInfo{}, meta.NetInfo{})
 
 	smap.addProxy(p.si)
@@ -109,13 +110,14 @@ func newPrimary(t *testing.T) *proxy {
 	p.owner.etl = e
 
 	p.gmm = memsys.PageMM()
+	p.htrun.svs.init()
 	return p
 }
 
 func newSecondary(name string) *proxy {
 	p := &proxy{}
 	p.si = newSnode(name, apc.Proxy, meta.NetInfo{}, meta.NetInfo{}, meta.NetInfo{})
-	p.owner.smap = newSmapOwner(cmn.GCO.Get())
+	p.owner.smap = newSmapOwner(cmn.GCO.Get(), false /*isTarget*/)
 	p.owner.smap.put(newSmap())
 
 	g.client.data = &http.Client{}
@@ -135,6 +137,7 @@ func newSecondary(name string) *proxy {
 	o := newBMDOwnerPrx(cmn.GCO.Get())
 	o.put(newBucketMD())
 	p.owner.bmd = o
+	p.htrun.svs.init()
 	return p
 }
 
@@ -174,6 +177,23 @@ func newTransportServer(primary *proxy, s *metaSyncServer, ch chan<- transportDa
 	primary.owner.smap.put(clone)
 
 	return ts
+}
+
+func TestMetasyncProxyRejectsMissingIntraHeaders(t *testing.T) {
+	p := newSecondary("p1")
+	payload := make(msPayload).marshal(memsys.PageMM())
+	defer payload.Free()
+
+	req := httptest.NewRequest(http.MethodPut, apc.URLPathMetasync.S, bytes.NewReader(payload.Bytes()))
+	req = req.WithContext(context.WithValue(req.Context(), keyReqNet, reqNetCtrl))
+	w := httptest.NewRecorder()
+	p.metasyncHandler(w, req)
+
+	herr := &cmn.ErrHTTP{}
+	tassert.CheckFatal(t, jsoniter.Unmarshal(w.Body.Bytes(), herr))
+	tassert.Fatalf(t, w.Code == http.StatusBadRequest && herr.Message == errNotIntraControl.Error(),
+		"expected missing intra-control headers to fail with %q, got status %d and %q",
+		errNotIntraControl, w.Code, herr.Message)
 }
 
 func TestMetasyncDeepCopy(t *testing.T) {

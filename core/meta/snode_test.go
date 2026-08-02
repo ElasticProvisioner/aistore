@@ -5,7 +5,6 @@
 package meta_test
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/NVIDIA/aistore/api/apc"
@@ -15,11 +14,11 @@ import (
 )
 
 func TestSnodeInitVerifyingKey(t *testing.T) {
-	pub, _, err := cos.GenerateNodeSigningKey()
+	pub, _, err := cos.GenerateNodeKeyPair()
 	tassert.CheckFatal(t, err)
 
 	si := &meta.Snode{}
 	si.Init("t1234567", apc.Target, pub)
 
-	tassert.Fatalf(t, bytes.Equal(si.VerifyingKey, pub), "verifying key mismatch")
+	tassert.Fatalf(t, cos.CryptoEqual(si.VerifyingKey, pub), "verifying key mismatch")
 }

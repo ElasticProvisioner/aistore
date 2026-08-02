@@ -2,7 +2,7 @@
 #
 # Generate Fern documentation pages from docs/ source files.
 #
-# Usage: scripts/fern/generate-pages.sh
+# Usage: scripts/fern/generate-pages.sh [--preview|--check|--build|--publish-preview]
 #
 # This script copies markdown from docs/ to fern/pages/, fixes image paths,
 # strips Jekyll frontmatter, escapes MDX-unsafe patterns, and auto-generates
@@ -18,6 +18,31 @@ FERN_DIR="$REPO_ROOT/fern"
 FERN_PAGES="$FERN_DIR/pages"
 DOCS_DIR="$REPO_ROOT/docs"
 SCRIPTS_DIR="$REPO_ROOT/scripts/fern"
+MODE="${1:-}"
+
+case "$MODE" in
+    ""|"--preview"|"--check"|"--build"|"--publish-preview") ;;
+    *)
+        echo "ERROR: Unknown option: $MODE" >&2
+        echo "Usage: scripts/fern/generate-pages.sh [--preview|--check|--build|--publish-preview]" >&2
+        exit 1
+        ;;
+esac
+
+restore_docs_yml() {
+    if [ -f "$FERN_DIR/docs.yml.bak" ]; then
+        mv "$FERN_DIR/docs.yml.bak" "$FERN_DIR/docs.yml"
+    fi
+}
+
+if [[ "$MODE" == "--check" ]]; then
+    trap restore_docs_yml EXIT
+fi
+
+if [[ "$MODE" == "--publish-preview" && -z "${FERN_TOKEN:-}" ]]; then
+    echo "ERROR: FERN_TOKEN is required to publish a Fern preview link." >&2
+    exit 1
+fi
 
 echo "Generating Fern pages from docs/..."
 
@@ -28,7 +53,7 @@ rm -rf "$FERN_PAGES"
 
 # ── 1. Create directories ────────────────────────────────────────────────
 
-mkdir -p "$FERN_PAGES"/{cli,blog,relnotes,tutorials/etl,proposals,images,assets}
+mkdir -p "$FERN_PAGES"/{cli,blog,tutorials/etl,proposals,images,assets}
 
 # ── 2. Copy source files ────────────────────────────────────────────────
 
@@ -41,7 +66,6 @@ for f in "$DOCS_DIR"/*.md; do
 done
 
 cp "$DOCS_DIR"/cli/*.md "$FERN_PAGES/cli/"
-cp "$DOCS_DIR"/relnotes/*.md "$FERN_PAGES/relnotes/"
 cp "$DOCS_DIR"/tutorials/etl/*.md "$FERN_PAGES/tutorials/etl/" 2>/dev/null || true
 cp "$DOCS_DIR"/proposals/*.md "$FERN_PAGES/proposals/" 2>/dev/null || true
 
@@ -93,7 +117,7 @@ find "$FERN_PAGES" -maxdepth 1 -name '*.md' -exec perl -pi \
     {} +
 
 # Subdirectory pages: need ../ prefix
-for subdir in cli blog relnotes proposals; do
+for subdir in cli blog proposals; do
     find "$FERN_PAGES/$subdir" -name '*.md' -exec perl -pi \
         -e 's|\]\(/docs/images/|](../images/|g;' \
         -e 's|\]\(/docs/assets/|](../assets/|g;' \
@@ -127,7 +151,7 @@ GITHUB_BASE="https://github.com/NVIDIA/aistore/blob/main"
 # MUST come before the .md-stripping step below; otherwise paths like
 # /memsys/README.md lose their .md and GitHub 404s the resulting URL.
 find "$FERN_PAGES" -name '*.md' -exec perl -pi \
-    -e 's{\]\(/(?!docs/|blog/|cli/|relnotes/|tutorials/|proposals/|assets/|images/|README|[#])([^)]+)\)}{]('"$GITHUB_BASE"'/$1)}g;' \
+    -e 's{\]\(/(?!docs/|blog/|cli/|tutorials/|proposals/|assets/|images/|README|[#])([^)]+)\)}{]('"$GITHUB_BASE"'/$1)}g;' \
     {} +
 
 # Strip .md extensions from remaining internal links only (skip http/https URLs)
@@ -166,15 +190,50 @@ python3 "$SCRIPTS_DIR/mdx-escape.py" "$FERN_PAGES"
 
 echo "Fern pages generated: $(find "$FERN_PAGES" -name '*.md' | wc -l) files"
 
-# ── Optional: preview or build ───────────────────────────────────────────
+# ── Optional: preview, check, build, or publish branch preview ───────────
 
-if [[ "${1:-}" == "--preview" || "${1:-}" == "--build" ]]; then
+if [[ "$MODE" == "--preview" || "$MODE" == "--check" || "$MODE" == "--build" || "$MODE" == "--publish-preview" ]]; then
     if ! command -v fern &>/dev/null; then
         echo "ERROR: 'fern' CLI not found. Install with: npm install -g fern-api" >&2
         exit 1
     fi
 
     cd "$REPO_ROOT"
+
+    if [[ "$MODE" == "--publish-preview" ]]; then
+        echo "Generating Python API reference (fern docs md generate)..."
+        fern docs md generate
+
+        fern check
+
+        preview_id="${FERN_PREVIEW_ID:-${CI_COMMIT_REF_SLUG:-branch-preview}}"
+        preview_log_file="${FERN_PREVIEW_LOG_FILE:-}"
+        preview_dotenv_file="${FERN_PREVIEW_DOTENV_FILE:-}"
+        echo "Publishing Fern preview with id: ${preview_id}"
+        set +e
+        output=$(FERN_TOKEN="$FERN_TOKEN" fern generate --docs --preview --id "$preview_id" --force 2>&1)
+        status=$?
+        set -e
+        if [ -n "$preview_log_file" ]; then
+            printf '%s\n' "$output" | tee "$preview_log_file"
+        else
+            printf '%s\n' "$output"
+        fi
+        if [ "$status" -ne 0 ]; then
+            exit "$status"
+        fi
+
+        preview_url=$(printf '%s\n' "$output" | sed -n 's/.*Published docs to \(https:\/\/[^[:space:]()]*\).*/\1/p' | tail -n 1)
+        if [ -z "$preview_url" ]; then
+            echo "ERROR: Fern preview URL was not found in command output." >&2
+            exit 1
+        fi
+        if [ -n "$preview_dotenv_file" ]; then
+            printf 'FERN_PREVIEW_URL=%s\n' "$preview_url" > "$preview_dotenv_file"
+        fi
+        echo "Fern preview URL: ${preview_url}"
+        exit 0
+    fi
 
     # fern/pages/python/ is auto-generated from source docstrings by
     # `fern docs md generate` (requires FERN_TOKEN). Run it here so users get
@@ -206,8 +265,10 @@ EOF
         echo "Created local-preview stub: $PYTHON_PAGES/index.mdx"
     fi
 
-    if [[ "${1:-}" == "--preview" ]]; then
+    if [[ "$MODE" == "--preview" ]]; then
         fern docs dev --port 3000
+    elif [[ "$MODE" == "--check" ]]; then
+        fern check
     else
         fern generate --docs
     fi

@@ -95,12 +95,6 @@ type (
 var _except = map[string]bool{
 	apc.QparamDontHeadRemote: false,
 
-	// flows that utilize the following query parameters perform conventional r.URL.Query()
-	// TODO -- FIXME: multipart must definitely transition to dpq
-	s3.QparamMptUploadID: false,
-	s3.QparamMptUploads:  false,
-	s3.QparamMptPartNo:   false,
-
 	s3.QparamAccessKeyID: false,
 	s3.QparamExpires:     false,
 	s3.QparamSignature:   false,
@@ -141,6 +135,11 @@ func dpqFree(d *dpq) {
 }
 
 func (dpq *dpq) get(qparam string) string { return dpq.m[qparam] }
+
+func (dpq *dpq) has(qparam string) bool {
+	_, ok := dpq.m[qparam]
+	return ok
+}
 
 func (dpq *dpq) parse(rawQuery string) error {
 	var (
@@ -217,8 +216,12 @@ func (dpq *dpq) parse(rawQuery string) error {
 			dpq.sv.sig = value // (base64.RawURLEncoding)
 
 		// Parameters that don't need unescaping
-		case apc.QparamMptUploadID, apc.QparamMptPartNo, apc.QparamFltPresence, apc.QparamBinfoWithOrWithoutRemote,
-			apc.QparamAppendType, apc.QparamETLName, apc.QparamETLTransformArgs,
+		case apc.QparamMptUploads, apc.QparamMptPartNo,
+			apc.QparamFltPresence, apc.QparamBinfoWithOrWithoutRemote,
+			apc.QparamETLName,
+			apc.QparamAppendType,
+			apc.QparamNewCustom,
+			apc.QparamKeepRemote,
 			apc.QparamTID:
 			dpq.m[key] = value
 
@@ -232,7 +235,9 @@ func (dpq *dpq) parse(rawQuery string) error {
 				continue
 			}
 
-			// Default: unescape and store in map
+			// Default: unescape and store in map - e.g.:
+			// - apc.QparamMptUploadID == s3.QparamMptUploadID (case in point: s3 uploadId)
+			// - apc.QparamETLTransformArgs (arbitrary JSON encoded via url.Values)
 			dpq.m[key], err = _unescape(value)
 		}
 
@@ -300,13 +305,6 @@ func (dpq *dpq) _arch(key, val string) (err error) {
 }
 
 func (dpq *dpq) isArch() bool { return dpq.arch.path != "" || dpq.arch.mmode != "" }
-
-func (dpq *dpq) isRedirect() (ptime string) {
-	if dpq.sys.pid == "" || dpq.sys.ptime == "" {
-		return
-	}
-	return dpq.sys.ptime
-}
 
 // err & log
 func (dpq *dpq) _archstr() string {

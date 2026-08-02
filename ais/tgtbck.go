@@ -34,26 +34,77 @@ import (
 // httpbck* handlers: list buckets/objects, summary (ditto), delete(bucket), head(bucket)
 //
 
+func (t *target) verifyBckVerb(w http.ResponseWriter, r *http.Request, dpq *dpq) bool /*ok*/ {
+	debug.Assert(dpq != nil)
+
+	// no access to user data with invalid cluster map (compare with /v1/cluster join, etc.)
+	smap := t.owner.smap.get()
+	if err := smap.validate(); err != nil {
+		t.writeErrf(w, r, "%s: cannot handle bucket request: %v", t.si, err)
+		return false
+	}
+
+	// bucket paths are not proxy-redirected
+	if hasRedirectMarker(dpq) {
+		t.writeErr(w, r, errDirectTargetAccess, http.StatusForbidden)
+		return false
+	}
+
+	if reqIsPub(r) {
+		config := cmn.GCO.Get()
+		// consistent with verifyObjVerb
+		if config.Auth.Enabled || config.Auth.IntraClusterConfigured() {
+			t.writeErr(w, r, errDirectTargetAccess, http.StatusForbidden)
+			return false
+		}
+		switch r.Method {
+		case http.MethodHead, http.MethodGet:
+			return true // allow direct read-only access
+		default:
+			t.writeErrf(w, r, "%s: %s(bucket) requires proxy mediation", t.si, r.Method)
+			return false
+		}
+	}
+
+	// no IsV50Bridge exemption here (compare w/ _verifyUnsigned) -
+	// bucket verbs arrive exclusively proxy=>target over intra-control via call()
+	if !reqIsIntraCtrl(r) {
+		t.writeErrf(w, r, "invalid bucket request over intra-data network: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		return false
+	}
+
+	if ecode, err := t.checkIntra(r, false /*only primary*/); err != nil {
+		t.writeErr(w, r, err, ecode)
+		return false
+	}
+	return true
+}
+
 // GET /v1/buckets[/bucket-name]
+// More precisely, 4 different paths:
+// - /v1/buckets                    - list buckets
+// - /v1/buckets/bucket-name        - list objects (NBI)
+// - /v1/buckets/bucket-name/phase  - list objects 2PC (x-lso)
+// - /v1/buckets/phase              - summary-style cases
 func (t *target) httpbckget(w http.ResponseWriter, r *http.Request, dpq *dpq) {
+	// do not use parseReq - note optional bucket/query bucket
 	apiItems, err := t.parseURL(w, r, apc.URLPathBuckets.L, 0, true)
 	if err != nil {
 		return
 	}
-	if err = t.checkIntraCall(r, false); err != nil {
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
+	if !t.verifyBckVerb(w, r, dpq) {
+		return
+	}
+
 	msg, err := t.readAisMsg(w, r)
 	if err != nil {
 		return
 	}
 	t.ensureLatestBMD(msg, r)
-
-	if err := dpq.parse(r.URL.RawQuery); err != nil {
-		t.writeErr(w, r, err)
-		return
-	}
 
 	switch msg.Action {
 	case apc.ActList:
@@ -450,6 +501,11 @@ func (t *target) bckSumm(w http.ResponseWriter, r *http.Request, phase string, b
 			t.writeErr(w, r, rns.Err, http.StatusInternalServerError, Silent)
 			return
 		}
+
+		xctn := rns.Entry.Get()
+		if !rns.IsRunning() {
+			xact.GoRunW(xctn)
+		}
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
@@ -494,6 +550,11 @@ func (t *target) shardSumm(w http.ResponseWriter, r *http.Request, phase string,
 		if rns.Err != nil {
 			t.writeErr(w, r, rns.Err, http.StatusInternalServerError, Silent)
 			return
+		}
+
+		xctn := rns.Entry.Get()
+		if !rns.IsRunning() {
+			xact.GoRunW(xctn)
 		}
 		w.WriteHeader(http.StatusAccepted)
 		return
@@ -553,6 +614,10 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
+	if !t.verifyBckVerb(w, r, apireq.dpq) {
+		return
+	}
+
 	if err := apireq.bck.Init(t.owner.bmd); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
@@ -567,7 +632,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	bck := apireq.bck
 	switch msg.Action {
 	case apc.ActEvictRemoteBck:
-		keepMD := cos.IsParseBool(apireq.query.Get(apc.QparamKeepRemote))
+		keepMD := cos.IsParseBool(apireq.dpq.get(apc.QparamKeepRemote))
 		if !keepMD {
 			t.writeErrAct(w, r, apc.ActEvictRemoteBck) // (instead, expecting updated BMD from primary)
 			return
@@ -577,7 +642,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 		var (
 			wg  = &sync.WaitGroup{}
 			nlp = newBckNLP(bck)
-			xid = apireq.query.Get(apc.QparamUUID)
+			xid = apireq.dpq.sys.uuid // apc.QparamUUID
 		)
 		nlp.Lock()
 		defer nlp.Unlock()
@@ -639,6 +704,9 @@ func (t *target) httpbckpost(w http.ResponseWriter, r *http.Request, apireq *api
 		return
 	}
 	if err := t.parseReq(w, r, apireq); err != nil {
+		return
+	}
+	if !t.verifyBckVerb(w, r, apireq.dpq) {
 		return
 	}
 
@@ -765,6 +833,9 @@ func (t *target) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *api
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
+	if !t.verifyBckVerb(w, r, apireq.dpq) {
+		return
+	}
 	t._bckhead(w, r, apireq, nil)
 }
 
@@ -787,7 +858,7 @@ func (t *target) _bckhead(w http.ResponseWriter, r *http.Request, apireq *apiReq
 		nlog.Warningf("%s: bucket %s is already in BMD; ignoring creation-time props (use bucket props API or CLI to update)", t, bck)
 	}
 	if cmn.Rom.V(5, cos.ModAIS) {
-		pid := apireq.query.Get(apc.QparamPID)
+		pid := apireq.dpq.sys.pid // apc.QparamPID
 		nlog.Infoln(r.Method, bck, "<=", pid)
 	}
 
@@ -795,7 +866,7 @@ func (t *target) _bckhead(w http.ResponseWriter, r *http.Request, apireq *apiReq
 
 	ctx := context.Background()
 	if bck.IsHT() {
-		originalURL := apireq.query.Get(apc.QparamOrigURL)
+		originalURL := apireq.dpq.sys.origURL // apc.QparamOrigURL
 		ctx = context.WithValue(ctx, cos.CtxOriginalURL, originalURL)
 		if !inBMD && originalURL == "" {
 			err := cmn.NewErrRemBckNotFound(bck.Bucket())
@@ -813,7 +884,7 @@ func (t *target) _bckhead(w http.ResponseWriter, r *http.Request, apireq *apiReq
 				t.writeErr(w, r, err, code, Silent)
 			} else {
 				err = cmn.NewErrFailedTo(t, "HEAD remote bucket", bck, err, code)
-				t._erris(w, r, err, code, cos.IsParseBool(apireq.query.Get(apc.QparamSilent)))
+				t._erris(w, r, err, code, apireq.dpq.silent) // apc.QparamSilent
 			}
 			return
 		}

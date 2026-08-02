@@ -5,6 +5,7 @@
 package xact
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"sync"
@@ -30,10 +31,13 @@ import (
 const finishSentinel = uint64(1)
 
 type (
+	// Base must be initialized via InitBase before use.
 	Base struct {
-		notif *NotifXact
-		bck   meta.Bck
-		abort struct {
+		ctx    context.Context
+		cancel context.CancelFunc
+		notif  *NotifXact
+		bck    meta.Bck
+		abort  struct {
 			ch     chan error
 			err    ratomic.Pointer[error]
 			done   atomic.Bool
@@ -56,8 +60,6 @@ type (
 	}
 )
 
-var IncFinished func()
-
 // common helper to go-run and wait until it actually starts running
 func GoRunW(xctn core.Xact) {
 	wg := &sync.WaitGroup{}
@@ -76,6 +78,7 @@ func (xctn *Base) InitBase(id, kind string, bck *meta.Bck) {
 
 	xctn.id, xctn.kind = id, kind
 
+	xctn.ctx, xctn.cancel = context.WithCancel(context.Background())
 	xctn.err = cos.NewErrs()
 	xctn.abort.ch = make(chan error, 1)
 	if bck != nil {
@@ -94,6 +97,9 @@ func (xctn *Base) ID() string   { return xctn.id }
 func (xctn *Base) Kind() string { return xctn.kind }
 
 func (xctn *Base) Bck() *meta.Bck { return &xctn.bck }
+
+// Context spans the xaction lifetime and is canceled when it aborts or finishes.
+func (xctn *Base) Context() context.Context { return xctn.ctx }
 
 // return true if 'stopping' OR 'finished'
 func (xctn *Base) IsDone() bool { return xctn.eutime.Load() != 0 }
@@ -174,6 +180,7 @@ func (xctn *Base) Abort(err error) bool {
 	perr := xctn.abort.err.Swap(&err)
 	debug.Assert(perr == nil, xctn.String())
 	debug.Assert(len(xctn.abort.ch) == 0, xctn.String()) // CAS above
+	xctn.cancel()
 
 	if xctn.abort.closed.CAS(false, true) {
 		xctn.abort.ch <- err
@@ -193,6 +200,7 @@ func (xctn *Base) Finish() {
 	if !xctn.eutime.CAS(0, finishSentinel) && !xctn.eutime.CAS(cos.MSB64, finishSentinel) {
 		return
 	}
+	xctn.cancel()
 
 	// serialized path
 	var (
@@ -384,7 +392,7 @@ func (xctn *Base) onFinished(err error, aborted bool) {
 		fs.CapRefresh(cmn.GCO.Get(), nil /*tcdf*/)
 	}
 
-	IncFinished() // in re: HK cleanup long-time finished
+	g.incFinished() // in re: HK cleanup long-time finished
 }
 
 func (xctn *Base) AddNotif(n core.Notif) {

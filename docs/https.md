@@ -6,7 +6,8 @@ In this document:
 - [Testing with self-signed certificates](#testing-with-self-signed-certificates)
 - [Observability: TLS related alerts](#observability-tls-related-alerts)
 - [Updating and reloading X.509 certificates](#updating-and-reloading-x509-certificates)
-- [Switching cluster between HTTP and HTTPS](#switching-cluster-between-http-and-https)
+- [Public and intra-cluster TLS configuration](#public-and-intra-cluster-tls-configuration)
+- [Further references](#further-references)
 
 ## Generating self-signed certificates
 
@@ -113,7 +114,7 @@ In addition, TLS certfificates tend to expire from time to time. In fact, each T
 
 > Some sources claim 398 days but the (much) larger point remains: TLS certificates do expire. Which means, they must be periodically updated and timely reloaded.
 
-Starting v3.24, AIStore:
+AIStore (AIS) always:
 
 * tracks certificate expiration times;
 * automatically - upon update - reloads updated certificates;
@@ -148,11 +149,11 @@ Quoting WWW:
 
 > "The validity periods for digital certificates are determined by their accepting organizations ...", at [https://www.sectigo.com/resource-library/how-long-are-digital-certificates-valid](https://www.sectigo.com/resource-library/how-long-are-digital-certificates-valid)
 
-Long story short, there is any number of reasons to update or replace X.509 certificate that AIStore uses to authenticate API calls.
+Long story short, there are many reasons to update or replace the X.509 certificates AIS cluster uses to authenticate API calls.
 
 But maybe the most common one is - expiration time. TLS certificates, also often referred to as [X.509](https://www.itu.int/rec/T-REC-X.509) certificates, do periodically expire. And the immediate implication is that the system must be able to (periodically) reload updated ones.
 
-In AIStore, related functionality consists of two pieces:
+In AIS, related functionality consists of two pieces:
 
 1. AIS nodes automatically reload updated certs while simultaneously adjusting the interval to check for the update.
 2. Separately, there's an administrative [API](https://github.com/NVIDIA/aistore/blob/main/api/cluster.go) and CLI (shown below) to reload certificate.
@@ -195,83 +196,63 @@ Overall, supported alerts include:
 | `tls-cert-expired` | X.509 expired (red alert, as the name implies) |
 | `tls-cert-invalid` | e.g., invalid PEM format; further details at [OpenSSL: X.509 errors](https://x509errors.org/)  |
 
-Finally, to view (existing) and/or reload (new) TLS certificates, see the following CLI reference:
+To view existing or reload new TLS certificates, see the following CLI reference:
 
 * [Managing TLS Certificates](/docs/cli/x509.md)
 
-When aistore is deployed with aithentication (enabled), the API (and CLI) to reload certificates will require administrative permissions.
+When AIS is deployed with authentication enabled, the API (and CLI) to reload certificates will require administrative permissions.
 
 > See `ais config cluster` command and related `auth.enabled` knob.
 
-### Further references
+## Public and intra-cluster TLS configuration
 
-* [HTTPS-related environment variables](environment-vars.md#https)
+AIS uses one cluster-wide HTTP/HTTPS mode (`net.http.use_https`) but may use different TLS configurations on its public and intra-cluster listeners.
+
+| Listener | TLS configuration |
+|---|---|
+| Intra-control | `net.http` |
+| Intra-data | `net.http` |
+| Public and additional public interfaces | `net.http.pub`, when configured |
+| Public without `net.http.pub` | Inherits the complete `net.http` TLS configuration |
+
+The optional `net.http.pub` section is an independent TLS configuration, not a field-by-field overlay.
+
+When `net.http.pub` is absent, public listeners reuse the default `net.http` TLS configuration, including its certificate and client-authentication policy.
+
+When `net.http.pub` is configured:
+
+- `server_crt` and `server_key` must both be specified;
+- public listeners use the public certificate and key;
+- `client_auth_tls` and `client_ca_tls` are independent of their `net.http` counterparts;
+- when the public TLS section is first configured, an omitted `client_auth_tls`
+  defaults to `NoClientCert`; it is not inherited from `net.http`;
+- the default and public certificates are loaded, reloaded, monitored, and reported independently.
+
+> **All public listeners share one TLS configuration.** The primary public address and all additional
+> [multi-home interfaces](/docs/networking.md) use the same certificate: `net.http.pub` when configured,
+> or the default `net.http` certificate otherwise. AIS currently provides no per-address or
+> SNI-based certificate selection.
+>
+> The certificate's Subject Alternative Name (**SAN**) extension must cover every DNS name or IP address
+> clients use to reach these listeners. Otherwise, client-side certificate verification fails with a
+> name mismatch when the cluster is accessed through an uncovered name or address.
+
+`client_auth_tls` uses Go standard library `tls.ClientAuthType` values:
+
+| Value | Mode | Client certificate | Verification | `client_ca_tls` required |
+|---:|---|---|---|---|
+| 0 | `NoClientCert` | Not requested | No | No |
+| 1 | `RequestClientCert` | Requested, optional | No | No |
+| 2 | `RequireAnyClientCert` | Required | No | No |
+| 3 | `VerifyClientCertIfGiven` | Requested, optional | Yes, when provided | Yes |
+| 4 | `RequireAndVerifyClientCert` | Required | Yes | Yes |
+
+In particular, `RequireAnyClientCert` requires a client certificate but does not verify its chain. AIS therefore loads `client_ca_tls` only for `VerifyClientCertIfGiven` and `RequireAndVerifyClientCert`.
+
+Certificate status and reload operations are described in [TLS certificate management](/docs/cli/x509.md).
+
+## Further references
+
+- [HTTPS-related environment variables](/docs/environment-vars.md#https)
 - [Managing TLS certificates](/docs/cli/x509.md)
-
-## Switching cluster between HTTP and HTTPS
-
-### From HTTP to HTTPS
-
-This assumes that [X.509 certificate already exists](getting_started.md#setting-up-https-locally) and the (HTTP-based) cluster is up and running. All we need to do at this point is switch it to HTTPS.
-
-```console
-# step 1: reconfigure cluster to use HTTPS
-$ ais config cluster net.http.use_https true
-
-# step 2: add information related to certs
-$ ais config cluster net.http.skip_verify true
-$ ais config cluster net.http.server_key <path-to-cert>/cert.key
-$ ais config cluster net.http.server_crt <path-to-cert>/cert.crt
-
-# step 3: shutdown
-$ ais cluster shutdown
-
-# step 4: remove cluster map - all copies at all possible locations, for example:
-$ find ~/.ais* -type f -name ".ais.smap" | xargs rm
-
-# step 5: restart
-$ make kill cli deploy <<< $'6\n6\n4\ny\ny\nn\n'
-
-# step 6: optionally, run aisloader
-$ AIS_ENDPOINT=https://localhost:8080 aisloader -bucket=ais://nnn -cleanup=false -numworkers=8 -pctput=0 -randomproxy
-
-# step 7: optionally, reconfigure CLI to skip X.509 verification:
-$ ais config cli set cluster.skip_verify_crt true
-
-# step 8: run CLI
-$ AIS_ENDPOINT=https://127.0.0.1:8080 ais show cluster
-
-$ AIS_ENDPOINT=https://127.0.0.1:8080 ais archive gen-shards "ais://abc/shard-{001..999}.tar.lz4"
-Shards created: 999/999 [==============================================================] 100 %
-
-$ export AIS_ENDPOINT=https://localhost:8080
-
-$ ais ls ais://abc --summary
-NAME           PRESENT         OBJECTS         SIZE (apparent, objects, remote)        USAGE(%)
-ais://abc      yes             999 0           5.86MiB 5.20MiB 0B                      0%
-...
-...
-```
-
-Goes without saying that `localhost` etc. are used here (and elsewhere) for purely illustrative purposes.
-
-Instead of `localhost`, `127.0.0.1`, port `8080`, and the `make` command above one must use their respective correct endpoints and proper deployment operations.
-
-### From HTTPS back to HTTP
-
-```console
-# step 1: disable HTTPS
-$ AIS_ENDPOINT=https://127.0.0.1:8080 ais config cluster net.http.use_https false
-
-# step 2: shutdown (notice that we are still using HTTPS endpoint)
-$ AIS_ENDPOINT=https://127.0.0.1:8080 ais cluster shutdown -y
-
-# step 3: remove cluster maps
-$ find ~/.ais* -type f -name ".ais.smap" | xargs rm
-
-# step 4: restart
-$ make kill cli deploy <<< $'6\n6\n4\ny\ny\nn\n'
-
-# step 5: and use
-$ ais show cluster
-
+- [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)

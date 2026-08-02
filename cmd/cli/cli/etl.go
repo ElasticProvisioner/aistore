@@ -30,7 +30,10 @@ const etlShowErrorsUsage = "Show ETL job errors.\n" +
 	indent1 + "\t- 'ais etl show errors <ETL_NAME>': display errors for inline object transformation failures.\n" +
 	indent1 + "\t- 'ais etl show errors <ETL_NAME> <JOB-ID>': display errors for a specific offline (bucket-to-bucket) transform job."
 
+const etlPodSpecDeprecationWarning = "Kubernetes Pod spec ETL initialization is deprecated and will be removed in v5.1; use an ETL runtime spec instead"
+
 const etlInitUsage = "Initialize ETL using a runtime spec or full Kubernetes Pod spec YAML file (local or remote).\n" +
+	indent1 + "DEPRECATED: Kubernetes Pod spec initialization will be removed in v5.1; use an ETL runtime spec instead.\n" +
 	indent1 + "Examples:\n" +
 	indent1 + "\t- 'ais etl init -f my-etl.yaml'\t deploy ETL from a local YAML file;\n" +
 	indent1 + "\t- 'ais etl init -f https://example.com/etl.yaml'\t deploy ETL from a remote YAML file;\n" +
@@ -102,6 +105,12 @@ const etlBucketUsage = "Transform entire bucket or selected objects (to select, 
 	indent1 + "\t- 'ais etl bucket my-etl ais://src ais://dst --num-workers 8'\t use 8 concurrent workers for transformation;\n" +
 	indent1 + "\t- 'ais etl bucket my-etl ais://src ais://dst --prepend processed/'\t add prefix to transformed object names."
 
+const etlInspectUsage = "Inspect each object with the specified ETL transformation for validation or other custom checks.\n" +
+	indent1 + "Examples:\n" +
+	indent1 + "\t- 'ais etl inspect my-etl ais://src'\t inspect all objects in a bucket;\n" +
+	indent1 + "\t- 'ais etl inspect my-etl ais://src --prefix images/'\t inspect objects with prefix 'images/';\n" +
+	indent1 + "\t- 'ais etl inspect my-etl ais://src --list obj-1,obj-2'\t inspect listed objects."
+
 const etlLogsUsage = "View ETL logs.\n" +
 	indent1 + "Examples:\n" +
 	indent1 + "\t- 'ais etl view-logs my-etl'\t show logs from all target nodes for the specified ETL;\n" +
@@ -138,6 +147,16 @@ var (
 			numWorkersFlag,
 			verbObjPrefixFlag,
 			// TODO: progressFlag,
+			waitFlag,
+			waitJobXactFinishedFlag,
+		},
+		cmdInspect: {
+			etlAllObjsFlag,
+			listFlag,
+			templateFlag,
+			numWorkersFlag,
+			verbObjPrefixFlag,
+			latestVerFlag,
 			waitFlag,
 			waitJobXactFinishedFlag,
 		},
@@ -201,7 +220,7 @@ var (
 		Subcommands: []cli.Command{
 			{
 				Name:   cmdSpec,
-				Usage:  "Start an ETL job using a YAML Pod specification (equivalent to 'ais etl init -f <spec-file.yaml|URL>')",
+				Usage:  "Start ETL from YAML; full Kubernetes Pod specs are DEPRECATED and will be removed in v5.1",
 				Flags:  sortFlags(etlSubFlags[cmdSpec]),
 				Action: etlInitSpecHandler,
 			},
@@ -223,6 +242,14 @@ var (
 		Flags:        sortFlags(etlSubFlags[cmdBucket]),
 		BashComplete: manyBucketsCompletions([]cli.BashCompleteFunc{etlIDCompletions}, 1),
 	}
+	inspectCmdETL = cli.Command{
+		Name:         cmdInspect,
+		Usage:        etlInspectUsage,
+		ArgsUsage:    etlNameArgument + " " + bucketObjectSrcArgument,
+		Action:       etlInspectHandler,
+		Flags:        sortFlags(etlSubFlags[cmdInspect]),
+		BashComplete: etlInspectCompletions,
+	}
 	logsCmdETL = cli.Command{
 		Name:         cmdViewLogs,
 		Usage:        etlLogsUsage,
@@ -243,12 +270,23 @@ var (
 			removeCmdETL,
 			objCmdETL,
 			bckCmdETL,
+			inspectCmdETL,
 		},
 	}
 )
 
 func etlIDCompletions(c *cli.Context) {
 	suggestEtlName(c, 0)
+}
+
+func etlInspectCompletions(c *cli.Context) {
+	// No positional args yet: complete the first arg, which is the ETL name.
+	if c.NArg() == 0 {
+		etlIDCompletions(c)
+		return
+	}
+	// One positional arg already exists: complete the source bucket/object only.
+	bucketCompletions(bcmplop{firstBucketIdx: 1})(c)
 }
 
 func suggestEtlName(c *cli.Context, shift int) {
@@ -405,6 +443,9 @@ func processSpecNode(c *cli.Context, node *yaml.Node) error {
 	msg, err := parseSpecNode(node)
 	if err != nil {
 		return fmt.Errorf("parse spec node: %w", err)
+	}
+	if _, ok := msg.(*etl.InitSpecMsg); ok {
+		actionWarn(c, etlPodSpecDeprecationWarning)
 	}
 
 	// 2) Populate CLI flags / common fields

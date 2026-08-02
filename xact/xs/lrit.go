@@ -6,16 +6,21 @@
 package xs
 
 import (
+	"errors"
+	"net/http"
 	"sync"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/cmn/debug"
+	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/fs"
+	"github.com/NVIDIA/aistore/hk"
 	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/sys"
 	"github.com/NVIDIA/aistore/xact"
@@ -56,7 +61,7 @@ type (
 
 	// common multi-object operation context and list|range|prefix logic
 	lrit struct {
-		parent cos.Stopper
+		parent core.Xact
 		bck    *meta.Bck
 		msg    *apc.ListRange      // traverse: msg
 		pt     *cos.ParsedTemplate // traverse: template
@@ -77,7 +82,7 @@ type (
 // lrit //
 //////////
 
-func (r *lrit) init(xctn cos.Stopper, msg *apc.ListRange, bck *meta.Bck, lsflags uint64, numWorkers, confBurst int) error {
+func (r *lrit) init(xctn core.Xact, msg *apc.ListRange, bck *meta.Bck, lsflags uint64, numWorkers, confBurst int) error {
 	l := fs.NumAvail()
 	if l == 0 {
 		xctn.Abort(cmn.ErrNoMountpaths)
@@ -274,7 +279,9 @@ func (r *lrit) _prefix(wi lrwi, smap *meta.Smap) error {
 		smap = nil // no need
 	}
 
-	page := make(cmn.LsoEntries, 0, iniPageCap)
+	var (
+		page = make(cmn.LsoEntries, 0, iniPageCap)
+	)
 	for !r.done() {
 		var (
 			err   error
@@ -288,14 +295,14 @@ func (r *lrit) _prefix(wi lrwi, smap *meta.Smap) error {
 		if bremote {
 			lst = &cmn.LsoRes{Entries: page}
 			// TODO: this is the last remaining place where we list remote bucket by each and every target
-			ecode, err = npg.bp.ListObjects(r.bck, lsmsg, lst)
+			ecode, err = r.lsoPage(npg.bp, lsmsg, lst)
 		} else {
 			npg.page.Entries = page
 			err = npg.nextPageA()
 			lst = &npg.page
 		}
 		if err != nil {
-			nlog.Errorln(core.T.String(), "[", err, "ecode", ecode, "]")
+			nlog.Errorln(r.bck.Cname(""), "failed list-objects: [", err, ecode, "]")
 			return err
 		}
 
@@ -329,6 +336,62 @@ func (r *lrit) _prefix(wi lrwi, smap *meta.Smap) error {
 	}
 
 	return nil
+}
+
+// list remote page: self-throttle and retry on 429 (see also: ais/rlbackend)
+// TODO: absorb into ais/rlbackend or remove once ListObjects rate limiting is
+// confirmed to handle all remote backends.
+const (
+	remPageRetriesMax = 6
+	remPageSleepIni   = 2 * time.Second
+)
+
+func (r *lrit) lsoPage(bp core.Backend, lsmsg *apc.LsoMsg, lst *cmn.LsoRes) (ecode int, err error) {
+	ctx := r.parent.Context()
+	ecode, err = bp.ListObjects(ctx, r.bck, lsmsg, lst)
+	if err == nil || !tooManyReqs(ecode, err) || r.parent.IsAborted() {
+		return ecode, err
+	}
+
+	// already retried via configured rate-limiter
+	var ebr *cmn.ErrBackendRetry
+	if errors.As(err, &ebr) {
+		return ecode, err
+	}
+
+	var (
+		retries int
+		total   time.Duration
+		now     = mono.NanoTime()
+		sleep   = remPageSleepIni
+	)
+	for retries = 1; retries < remPageRetriesMax; retries++ {
+		sleep = hk.Jitter(sleep+sleep/2, now+int64(sleep))
+		select {
+		case <-ctx.Done():
+			return 0, r.parent.AbortErr()
+		case <-time.After(sleep):
+		}
+		total += sleep
+
+		ecode, err = bp.ListObjects(ctx, r.bck, lsmsg, lst)
+		if err == nil {
+			if cmn.Rom.V(4, cos.ModXs) {
+				nlog.Warningln(r.bck.Cname(""), "list-objects: recovered after", retries, "retries, waited", total)
+			}
+			return 0, nil
+		}
+		if !tooManyReqs(ecode, err) || r.parent.IsAborted() {
+			return ecode, err
+		}
+	}
+	nlog.Warningln(r.bck.Cname(""), "list-objects: giving up after", retries-1, "retries, waited", total, "[", err, ecode, "]")
+
+	return ecode, err
+}
+
+func tooManyReqs(ecode int, err error) bool {
+	return ecode == http.StatusTooManyRequests || cmn.IsErrTooManyRequests(err)
 }
 
 func (r *lrit) do(lom *core.LOM, wi lrwi, smap *meta.Smap) (bool /*this lom done*/, error) {

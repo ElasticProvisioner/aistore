@@ -1,10 +1,11 @@
 // Package dload implements functionality to download resources into AIS cluster from external source.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package dload
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -395,7 +396,8 @@ func (j *backendDlJob) getNextObjs() error {
 			lst = &cmn.LsoRes{}
 			msg = &apc.LsoMsg{Prefix: j.prefix, ContinuationToken: j.continuationToken, PageSize: j.bck.MaxPageSize()}
 		)
-		_, err := backend.ListObjects(j.bck, msg, lst)
+		// TODO: plumb the downloader xaction context.
+		_, err := backend.ListObjects(context.Background(), j.bck, msg, lst)
 		if err != nil {
 			return err
 		}

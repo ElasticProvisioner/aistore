@@ -25,7 +25,8 @@ const (
 )
 
 const (
-	EnforceIntraClusterAccess = Flags(1 << iota)
+	EnforceIntraClusterAccess = Flags(1 << iota) // Deprecated: use auth.intra_cluster to secure intra-cluster communications
+
 	SkipVC                    // skip loading existing object's metadata, Version and Checksum (VC) in particular (advanced usage only)
 	DontAutoDetectFshare      // do not auto-detect file share (NFS, SMB) when _promoting_ shared files to AIS
 	S3APIviaRoot              // handle s3 requests via `aistore-hostname/` (default: `aistore-hostname/s3`)
@@ -52,6 +53,7 @@ const (
 	CountObjectNotFoundStats  // count GET(object) 404 (not-found) as errors (default: don't); TODO: add Prometheus to count HEAD(object) errors
 	EnableGoRuntimeMetrics    // publish selected Go runtime metrics via Prometheus
 	DloadAllowPrivateEgress   // allow downloader egress to private RFC1918/ULA addresses; loopback and link-local remain blocked
+	S3RedirectRebuild         // allow S3 clients that rebuild redirected requests instead of following the Location URI (forbidden when AuthN or intra-cluster signing is configured)
 )
 
 var Cluster = [...]string{
@@ -82,6 +84,7 @@ var Cluster = [...]string{
 	"Count-Object-NotFound-Stats",
 	"Enable-Go-Runtime-Metrics",
 	"Dload-Allow-Private-Egress",
+	"S3-Redirect-Rebuild",
 
 	// apc.ResetToken ("none") ===========
 }
@@ -105,10 +108,22 @@ func (f *Flags) Validate() error {
 	if f.IsSet(DisableColdGET) && f.IsSet(StreamingColdGET) {
 		return fmt.Errorf("feature flags %q and %q are mutually exclusive", DisableColdGET.name(), StreamingColdGET.name())
 	}
+	if f.IsSet(S3ReverseProxy) && f.IsSet(S3RedirectRebuild) {
+		return fmt.Errorf("feature flags %q and %q are mutually exclusive", S3ReverseProxy.name(), S3RedirectRebuild.name())
+	}
 	return nil
 }
 
-func (f *Flags) ValidateAsProps(...any) error { return f.Validate() }
+// TODO: consider an alternative name, e.g. ValidateWithContext
+func (f *Flags) ValidateAsProps(requiresProxyMediation ...any) error {
+	if err := f.Validate(); err != nil || len(requiresProxyMediation) == 0 || !f.IsSet(S3RedirectRebuild) {
+		return err
+	}
+	if protected := requiresProxyMediation[0].(bool); protected {
+		return fmt.Errorf("feature flag %q is incompatible with configuration that requires proxy mediation", S3RedirectRebuild.name())
+	}
+	return nil
+}
 
 func (f Flags) IsSet(flag Flags) bool { return cos.BitFlags(f).IsSet(cos.BitFlags(flag)) }
 func (f Flags) Set(flags Flags) Flags { return Flags(cos.BitFlags(f).Set(cos.BitFlags(flags))) }

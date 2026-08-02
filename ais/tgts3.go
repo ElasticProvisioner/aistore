@@ -32,36 +32,58 @@ func (t *target) s3Handler(w http.ResponseWriter, r *http.Request) {
 	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln("s3Handler", t.String(), r.Method, r.URL)
 	}
+
 	apiItems, err := t.parseURL(w, r, apc.URLPathS3.L, 0, true)
 	if err != nil {
+		return
+	}
+	dpq := dpqAlloc()
+	defer dpqFree(dpq)
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Code: s3.ErrCodeInvalidArgument})
+		return
+	}
+	dpq.isS3 = true
+
+	if ecode, err := t.checkObjVerb(r, dpq); err != nil {
+		code := s3.ErrCodeInvalidRequest
+		if ecode == http.StatusUnauthorized || ecode == http.StatusForbidden {
+			ecode = http.StatusForbidden // S3 uses 403 AccessDenied, not 401
+			code = s3.ErrCodeAccessDenied
+		}
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: ecode, Code: code})
+		return
+	}
+	if len(apiItems) == 0 {
+		// GET /s3 ListBuckets is currently proxy-local (see p.s3Handler); target-side root requests are unsupported.
+		s3.WriteErr(w, r, s3.ErrInfo{Err: errS3Req, Code: s3.ErrCodeInvalidRequest})
 		return
 	}
 
 	switch r.Method {
 	case http.MethodHead:
-		t.headObjS3(w, r, apiItems)
+		t.headObjS3(w, r, apiItems) // (not using dpq when intra_control sign/verify disabled)
 	case http.MethodGet:
-		t.getObjS3(w, r, apiItems)
+		t.getObjS3(w, r, apiItems, dpq)
 	case http.MethodPut:
-		config := cmn.GCO.Get()
-		t.putCopyMpt(w, r, config, apiItems)
+		t.putCopyMpt(w, r, dpq, apiItems)
 	case http.MethodDelete:
-		q := r.URL.Query()
-		if q.Has(s3.QparamMptUploadID) {
-			t.abortMptS3(w, r, apiItems, q)
+		if dpq.has(s3.QparamMptUploadID) {
+			t.abortMptS3(w, r, dpq, apiItems)
 		} else {
 			t.delObjS3(w, r, apiItems)
 		}
 	case http.MethodPost:
-		t.postObjS3(w, r, apiItems)
+		t.postObjS3(w, r, apiItems, dpq)
 	default:
 		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodHead, http.MethodPut, http.MethodPost)
+		return
 	}
 }
 
 // PUT /s3/<bucket-name>/<object-name>
 // [switch] mpt | put | copy
-func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, config *cmn.Config, items []string) {
+func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, dpq *dpq, items []string) {
 	cs := fs.Cap()
 	if cs.IsOOS() {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: cs.Err(), Status: http.StatusInsufficientStorage})
@@ -77,9 +99,8 @@ func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, config *cmn.
 		s3.HandleAwsChunked(r)
 	}
 
-	q := r.URL.Query()
 	switch {
-	case q.Has(s3.QparamMptPartNo) && q.Has(s3.QparamMptUploadID):
+	case dpq.has(s3.QparamMptPartNo) && dpq.has(s3.QparamMptUploadID):
 		if r.Header.Get(cos.S3HdrObjSrc) != "" {
 			// TODO:
 			// copy another object (or its range) => part of the specified multipart upload.
@@ -89,19 +110,19 @@ func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, config *cmn.
 			return
 		}
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("putPartMpt", bck.String(), items, q)
+			nlog.Infoln("putPartMpt", bck.String(), items, dpq.m)
 		}
-		t.putPartMptS3(w, r, items, q, bck)
+		t.putPartMptS3(w, r, dpq, bck, items)
 	case r.Header.Get(cos.S3HdrObjSrc) == "":
 		objName, errN := s3.JoinValidateOname(w, r, items)
 		if errN != nil {
 			return
 		}
 		lom := core.AllocLOM(objName)
-		t.putObjS3(w, r, bck, config, lom)
+		t.putObjS3(w, r, bck, lom, dpq)
 		core.FreeLOM(lom)
 	default:
-		t.copyObjS3(w, r, config, items)
+		t.copyObjS3(w, r, items)
 	}
 }
 
@@ -110,7 +131,7 @@ func (t *target) putCopyMpt(w http.ResponseWriter, r *http.Request, config *cmn.
 // Note:
 // S3 copy object API use the "destination" bucket in the URL path, but AIStore target use "source" bucket
 // we need this extra `copyObjS3` handler at target to address the translation
-func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.Config, items []string) {
+func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, items []string) {
 	src := r.Header.Get(cos.S3HdrObjSrc)
 
 	// [HACK]
@@ -173,6 +194,7 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 		return
 	}
 
+	config := cmn.GCO.Get()
 	ecode, err = t.copyObject(lom, bckTo, objNameTo, nil /*dpq*/, config)
 	if err != nil {
 		if err == cmn.ErrSkip || ecode == http.StatusNotFound {
@@ -201,7 +223,7 @@ func (t *target) copyObjS3(w http.ResponseWriter, r *http.Request, config *cmn.C
 	sgl.Free()
 }
 
-func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck, config *cmn.Config, lom *core.LOM) {
+func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lom *core.LOM, dpq *dpq) {
 	if err := lom.InitBck(bck); err != nil {
 		if cmn.IsErrRemoteBckNotFound(err) {
 			t.BMDVersionFixup(r)
@@ -215,20 +237,12 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 	started := time.Now()
 	lom.SetAtimeUnix(started.UnixNano())
 
-	// TODO: dual checksumming, e.g. lom.SetCustom(apc.AWS, ...)
-
-	dpq := dpqAlloc()
-	if err := dpq.parse(r.URL.RawQuery); err != nil {
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
-		dpqFree(dpq)
-		return
-	}
 	poi := allocPOI()
 	{
 		poi.atime = started.UnixNano()
 		poi.t = t
 		poi.lom = lom
-		poi.config = config
+		poi.config = cmn.GCO.Get()
 		poi.skipVC = cmn.Rom.Features().IsSet(feat.SkipVC) || dpq.skipVC // apc.QparamSkipVC
 		poi.restful = true
 	}
@@ -240,11 +254,10 @@ func (t *target) putObjS3(w http.ResponseWriter, r *http.Request, bck *meta.Bck,
 	} else {
 		s3.SetS3Headers(w.Header(), lom)
 	}
-	dpqFree(dpq)
 }
 
 // GET s3/<bucket-name[/<object-name>]
-func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string) {
+func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string, dpq *dpq) {
 	bucket := items[0]
 	bck, ecode, err := meta.InitByNameOnly(bucket, t.owner.bmd)
 	if err != nil {
@@ -252,14 +265,11 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 		return
 	}
 
-	// TODO -- FIXME: transition to dpq
-	q := r.URL.Query()
-
-	if len(items) == 1 && q.Has(s3.QparamMptUploads) {
+	if len(items) == 1 && dpq.has(s3.QparamMptUploads) {
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("listUploadsMpt", bck.String(), q)
+			nlog.Infoln("listUploadsMpt", bck.String(), dpq.m)
 		}
-		t.listUploadsMptS3(w, bck, q)
+		t.listUploadsMptS3(w, bck, dpq)
 		return
 	}
 	if len(items) < 2 {
@@ -271,32 +281,25 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if errN != nil {
 		return
 	}
-	if q.Has(s3.QparamMptPartNo) {
+	if dpq.has(s3.QparamMptPartNo) {
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("getMptPart", bck.String(), objName, q)
+			nlog.Infoln("getMptPart", bck.String(), objName, dpq.m)
 		}
 		lom := core.AllocLOM(objName)
-		t.getPartMptS3(w, r, bck, lom, q)
+		t.getPartMptS3(w, r, bck, lom, dpq)
 		core.FreeLOM(lom)
 		return
 	}
-	uploadID := q.Get(s3.QparamMptUploadID)
+	uploadID := dpq.get(s3.QparamMptUploadID)
 	if uploadID != "" {
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("listPartsMpt", bck.String(), objName, q)
+			nlog.Infoln("listPartsMpt", bck.String(), objName, dpq.m)
 		}
-		t.listPartsMptS3(w, r, bck, objName, q)
+		t.listPartsMptS3(w, r, bck, objName, dpq)
 		return
 	}
 
-	dpq := dpqAlloc()
-	if err := dpq.parse(r.URL.RawQuery); err != nil {
-		dpqFree(dpq)
-		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
-		return
-	}
 	lom := core.AllocLOM(objName)
-	dpq.isS3 = true
 	lom, err = t.getObject(w, r, dpq, bck, lom)
 	core.FreeLOM(lom)
 
@@ -307,7 +310,6 @@ func (t *target) getObjS3(w http.ResponseWriter, r *http.Request, items []string
 		}
 		s3.WriteErr(w, r, ei)
 	}
-	dpqFree(dpq)
 }
 
 // HEAD /s3/<bucket-name>/<object-name> (TODO: s3.HdrMptCnt)
@@ -417,27 +419,29 @@ func (t *target) delObjS3(w http.ResponseWriter, r *http.Request, items []string
 }
 
 // POST /s3/<bucket-name>/<object-name>
-func (t *target) postObjS3(w http.ResponseWriter, r *http.Request, items []string) {
+func (t *target) postObjS3(w http.ResponseWriter, r *http.Request, items []string, dpq *dpq) {
 	bck, ecode, err := meta.InitByNameOnly(items[0], t.owner.bmd)
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: ecode})
 		return
 	}
-	q := r.URL.Query()
-	if q.Has(s3.QparamMptUploads) {
+
+	if dpq.has(s3.QparamMptUploads) {
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("startMpt", bck.String(), items, q)
+			nlog.Infoln("startMpt", bck.String(), items, dpq.m)
 		}
-		t.startMptS3(w, r, items, bck)
+		t.startMptS3(w, r, bck, items)
 		return
 	}
-	if q.Has(s3.QparamMptUploadID) {
+
+	if dpq.has(s3.QparamMptUploadID) {
 		if cmn.Rom.V(5, cos.ModS3) {
-			nlog.Infoln("completeMpt", bck.String(), items, q)
+			nlog.Infoln("completeMpt", bck.String(), items, dpq.m)
 		}
-		t.completeMptS3(w, r, items, q, bck)
+		t.completeMptS3(w, r, dpq, bck, items)
 		return
 	}
+
 	err = fmt.Errorf("set query parameter %q to start multipart upload or %q to complete the upload",
 		s3.QparamMptUploads, s3.QparamMptUploadID)
 	s3.WriteErr(w, r, s3.ErrInfo{Err: err})

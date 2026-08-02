@@ -1,4 +1,4 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
@@ -35,11 +35,12 @@ func newHTRunWithSmap() (*htrun, string) {
 	config := cmn.GCO.BeginUpdate()
 	cmn.GCO.CommitUpdate(config)
 
-	h.owner.smap = newSmapOwner(config)
+	h.owner.smap = newSmapOwner(config, false /*isTarget*/)
 	smap := newSmap()
 	smap.addProxy(h.si)
 	smap.Primary = h.si
 	h.owner.smap.put(smap)
+	h.svs.init()
 	return h, primaryID
 }
 
@@ -80,8 +81,9 @@ func TestIsClusterNode_InvalidSmap(t *testing.T) {
 	config := cmn.GCO.BeginUpdate()
 	cmn.GCO.CommitUpdate(config)
 
-	h.owner.smap = newSmapOwner(config)
+	h.owner.smap = newSmapOwner(config, false /*isTarget*/)
 	h.owner.smap.put(newSmap())
+	h.svs.init()
 
 	hdr := http.Header{}
 	hdr.Set(apc.HdrSenderID, "p1")

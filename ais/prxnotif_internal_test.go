@@ -1,4 +1,4 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
@@ -79,6 +79,7 @@ var _ = Describe("Notifications xaction test", func() {
 			palive := newPalive(p, tracker, atomic.NewBool(true))
 			palive.keepalive.hb = &nopHB{}
 			p.keepalive = palive
+			p.htrun.svs.init()
 			return p
 		}
 
@@ -89,7 +90,7 @@ var _ = Describe("Notifications xaction test", func() {
 				fin: newListeners(),
 			}
 			smap := &smapX{Smap: meta.Smap{Version: 1}}
-			n.p.htrun.owner.smap = newSmapOwner(cmn.GCO.Get())
+			n.p.htrun.owner.smap = newSmapOwner(cmn.GCO.Get(), false /*isTarget*/)
 			n.p.htrun.owner.smap.put(smap)
 			n.p.htrun.startup.cluster = *atomic.NewInt64(1)
 			return n
@@ -179,6 +180,36 @@ var _ = Describe("Notifications xaction test", func() {
 			n._finished(nl1, targets[target1ID], msg)
 			Expect(msg.ErrMsg).To(BeEquivalentTo(nl1.Err().Error()))
 			Expect(nl1.ActiveNotifiers().Contains(target1ID)).To(BeFalse())
+		})
+
+		It("should preserve an error when a stats refresh wins the terminal race", func() {
+			const errMsg = "xaction failed before terminal notification"
+
+			snap := finishedXact(xid)
+			snap.Err = errMsg
+			targets := getNodeMap(target1ID)
+			nl1 = xact.NewXactNL(xid, apc.ActECEncode, &smap.Smap, targets)
+			Expect(n.add(nl1)).To(Succeed())
+
+			done := n.reconcilePulledStats(nl1, targets[target1ID], snap, true, false)
+			Expect(done).To(BeTrue())
+			n.done(nl1)
+
+			Expect(nl1.IsFinished()).To(BeTrue())
+			Expect(nl1.Err()).To(MatchError(errMsg))
+		})
+
+		It("should prefer an abort error from refreshed finished stats", func() {
+			const abortErr = "xaction aborted on target"
+
+			snap := abortedXact(xid)
+			snap.Err = "earlier xaction error"
+			snap.AbortErr = abortErr
+			done := n.reconcilePulledStats(nl1, targets[target1ID], snap, true, snap.AbortedX)
+
+			Expect(done).To(BeTrue())
+			Expect(nl1.Err()).To(MatchError(abortErr))
+			Expect(nl1.IsAborted()).To(BeTrue())
 		})
 
 		It("should finish when all the Notifiers finished", func() {

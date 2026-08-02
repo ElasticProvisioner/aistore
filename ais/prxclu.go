@@ -72,6 +72,7 @@ func (p *proxy) httpcluget(w http.ResponseWriter, r *http.Request, isPub bool) {
 		query = r.URL.Query()
 		what  = query.Get(apc.QparamWhat)
 	)
+	debug.Assert(reqIsPub(r) == isPub)
 	if isPub {
 		if err := p.checkAccess(w, r, nil, apc.AceShowCluster); err != nil {
 			return
@@ -501,6 +502,7 @@ func (p *proxy) httpcluput(w http.ResponseWriter, r *http.Request, isPub bool) {
 	}
 
 	// admin access via pub net - all actions
+	debug.Assert(reqIsPub(r) == isPub)
 	if isPub {
 		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
 			return
@@ -1626,6 +1628,7 @@ func (p *proxy) _stopMaintRMD(ctx *smapModifier, clone *smapX) {
 // Remove a node from the cluster by daemon ID.
 // Used for self-initiated node removal (e.g., when a node loses all mountpaths).
 func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request, isPub bool) {
+	debug.Assert(reqIsPub(r) == isPub)
 	if isPub {
 		p.writeErrMsg(w, r, "not expecting DELETE /v1/cluster via pub-net", http.StatusForbidden)
 		return
@@ -1664,9 +1667,9 @@ func (p *proxy) httpcludel(w http.ResponseWriter, r *http.Request, isPub bool) {
 		return
 	}
 
-	if err := p.checkIntraCall(r, false /*from primary*/); err != nil {
+	if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
 		err = fmt.Errorf("%w (action %q)", err, apc.ActSelfRemove)
-		p.writeErr(w, r, err)
+		p.writeErr(w, r, err, ecode)
 		return
 	}
 

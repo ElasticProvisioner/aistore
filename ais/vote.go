@@ -1,6 +1,6 @@
 // Package ais provides AIStore's proxy and target nodes.
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -75,6 +75,9 @@ func voteInProgress() (xele core.Xact) {
 
 // [METHOD] /v1/vote
 func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
+	if !p.ensureIntraControl(w, r, false /* from primary */) {
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPut {
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 		return
@@ -104,8 +107,12 @@ func (p *proxy) voteHandler(w http.ResponseWriter, r *http.Request) {
 	case apc.VoteInit:
 		p.httpelect(w, r)
 	case apc.PriStop:
-		senderID := r.Header.Get(apc.HdrSenderID)
-		p.onPrimaryDown(p, senderID)
+		sid, _, _, err := p.parseSenderHdrs(r.Header)
+		if err != nil {
+			p.writeErr(w, r, err, http.StatusForbidden)
+			return
+		}
+		p.onPrimaryDown(p, sid)
 	default:
 		p.writeErrURL(w, r)
 	}
@@ -131,6 +138,11 @@ func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	smap := p.owner.smap.get()
+	if newSmap.UUID != smap.UUID {
+		p.writeErrf(w, r, "%s: %s UUID mismatch in the Vote Request (%q vs %q)", p, clusterMap, newSmap.UUID, smap.UUID)
+		return
+	}
+
 	sender := r.Header.Get(apc.HdrSenderName)
 
 	nlog.Infoln(tag, pnameC, "receive", newSmap.StringEx(), "from", sender, "local [", smap.StringEx(), "]")
@@ -140,12 +152,16 @@ func (p *proxy) httpelect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	debug.Assert(!newSmap.isPrimary(p.si))
+	if newSmap.isPrimary(p.si) {
+		p.writeErrf(w, r, "%s %s: self is primary in the Vote Request, %s", tag, pname, newSmap)
+		return
+	}
 
 	if err := p.owner.smap.synchronize(p.si, newSmap, nil /*ms payload*/, p.htrun.smapUpdatedCB); err != nil {
 		if isErrDowngrade(err) {
 			psi := newSmap.GetProxy(msg.Request.Candidate)
 			psi2 := p.owner.smap.get().GetProxy(msg.Request.Candidate)
-			if psi2.Eq(psi) {
+			if psi2.EqNetID(psi) {
 				err = nil
 			}
 		}
@@ -414,6 +430,9 @@ func (p *proxy) electPhase2(vr *VoteRecord) cos.StrSet {
 
 // [METHOD] /v1/vote
 func (t *target) voteHandler(w http.ResponseWriter, r *http.Request) {
+	if !t.ensureIntraControl(w, r, false /* from primary */) {
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPut {
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPut)
 		return
@@ -531,6 +550,17 @@ func (h *htrun) httpgetvote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newSmap := msg.Record.Smap
+
+	if newSmap == nil {
+		h.writeErrf(w, r, "%s: no %s in the VoteRecord [%v]", h, clusterMap, msg.Record)
+		return
+	}
+	debug.Assert(cos.IsValidUUID(newSmap.UUID))
+	if newSmap.UUID != smap.UUID {
+		h.writeErrf(w, r, "%s: %s UUID mismatch in the VoteRecord (%q vs %q)", h, clusterMap, newSmap.UUID, smap.UUID)
+		return
+	}
+
 	psi := newSmap.GetProxy(candidate)
 	if psi == nil {
 		h.writeErrf(w, r, "%s: candidate %q not present in the VoteRecord %s", h, candidate, newSmap)
@@ -546,7 +576,7 @@ func (h *htrun) httpgetvote(w http.ResponseWriter, r *http.Request) {
 		if isErrDowngrade(err) {
 			newSmap2 := h.owner.smap.get()
 			psi2 := newSmap2.GetProxy(candidate)
-			if psi2.Eq(psi) {
+			if psi2.EqNetID(psi) {
 				err = nil // not an error - can vote Yes
 			}
 		}

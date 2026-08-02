@@ -37,6 +37,9 @@ const (
 
 type (
 	validator interface {
+		// validate _and_ mutate live section -
+		// populate zero (nil) fields with their system defaults
+		// (implementation must be idempotent)
 		Validate() error
 	}
 	contextValidator interface {
@@ -55,7 +58,7 @@ type (
 	Config struct {
 		role          string `list:"omit"` // apc.Proxy | apc.Target
 		LocalConfig   `json:",inline"`
-		ClusterConfig `json:",inline"`
+		ClusterConfig `json:",inline"` // see IterFields `tagInline`
 	}
 )
 
@@ -78,7 +81,7 @@ type (
 		PortIntraControl     int    `json:"port_intra_control,string"` // --/-- for intra-cluster control
 		PortIntraData        int    `json:"port_intra_data,string"`    // --/-- for intra-cluster data
 		// omit
-		UseIntraControl bool `json:"-"`
+		UseIntraControl bool `json:"-"` // always true starting 5.0
 		UseIntraData    bool `json:"-"`
 	}
 
@@ -113,11 +116,12 @@ type (
 		TCB         *TCBConf        `json:"tcb,omitempty" allow:"cluster"`
 		TCO         *TCOConf        `json:"tco,omitempty" allow:"cluster"`
 		Arch        *ArchConf       `json:"arch,omitempty" allow:"cluster"`
+		Lso         *LsoConf        `json:"lso,omitempty" allow:"cluster"`
 		RateLimit   RateLimitConf   `json:"rate_limit"`
 		Keepalive   KeepaliveConf   `json:"keepalivetracker"`
 		Rebalance   RebalanceConf   `json:"rebalance" allow:"cluster"`
 		Log         LogConf         `json:"log"`
-		EC          ECConf          `json:"ec" allow:"cluster"`
+		EC          *ECConf         `json:"ec,omitempty" allow:"cluster"`
 		GetBatch    GetBatchConf    `json:"get_batch" allow:"cluster"`
 		Net         NetConf         `json:"net" allow:"cluster"`
 		Timeout     TimeoutConf     `json:"timeout"`
@@ -126,9 +130,9 @@ type (
 		Memsys      MemsysConf      `json:"memsys"`
 		Disk        DiskConf        `json:"disk"`
 		FSHC        FSHCConf        `json:"fshc"`
-		Chunks      ChunksConf      `json:"chunks" allow:"cluster"`
+		Chunks      *ChunksConf     `json:"chunks,omitempty" allow:"cluster"`
 		LRU         LRUConf         `json:"lru"`
-		Mirror      MirrorConf      `json:"mirror" allow:"cluster"`
+		Mirror      *MirrorConf     `json:"mirror,omitempty" allow:"cluster"`
 		Periodic    PeriodConf      `json:"periodic" allow:"cluster"`
 		Client      ClientConf      `json:"client"`
 		Downloader  DownloaderConf  `json:"downloader"`
@@ -167,6 +171,7 @@ type (
 		TCB         *TCBConfToSet         `json:"tcb,omitempty"`
 		TCO         *TCOConfToSet         `json:"tco,omitempty"`
 		Arch        *ArchConfToSet        `json:"arch,omitempty"`
+		Lso         *LsoConfToSet         `json:"lso,omitempty"`
 		WritePolicy *WritePolicyConfToSet `json:"write_policy,omitempty"`
 		Proxy       *ProxyConfToSet       `json:"proxy,omitempty"`
 		RateLimit   *RateLimitConfToSet   `json:"rate_limit,omitempty"`
@@ -677,12 +682,26 @@ type (
 		SndRcvBufSize int    `json:"sndrcv_buf_size"` // SO_RCVBUF and SO_SNDBUF
 	}
 
+	// TLSConf contains TLS-specific config options.
+	TLSConf struct {
+		Certificate   string `json:"server_crt"`      // HTTPS: X.509 certificate
+		CertKey       string `json:"server_key"`      // HTTPS: X.509 key
+		ClientCA      string `json:"client_ca_tls"`   // required when client_auth_tls >= VerifyClientCertIfGiven
+		ClientAuthTLS int    `json:"client_auth_tls"` // tls.ClientAuthType enum
+	}
+
+	TLSConfToSet struct {
+		Certificate   *string `json:"server_crt,omitempty"`
+		CertKey       *string `json:"server_key,omitempty"`
+		ClientCA      *string `json:"client_ca_tls,omitempty"`
+		ClientAuthTLS *int    `json:"client_auth_tls,omitempty"`
+	}
+
 	HTTPConf struct {
-		Proto         string `json:"-"`             // http or https (set depending on `UseHTTPS`)
-		Certificate   string `json:"server_crt"`    // HTTPS: X.509 certificate
-		CertKey       string `json:"server_key"`    // HTTPS: X.509 key
-		ServerNameTLS string `json:"domain_tls"`    // #6410
-		ClientCA      string `json:"client_ca_tls"` // #6410
+		Proto string `json:"-"` // http or https (set depending on `UseHTTPS`)
+
+		TLSConf       `json:",inline"` // see IterFields `tagInline`
+		ServerNameTLS string           `json:"domain_tls"` // #6410
 
 		// client-side idle connection timeouts: intra-cluster and backend/cloud
 		IdleConnTimeout        cos.Duration `json:"idle_conn_time"`
@@ -691,29 +710,30 @@ type (
 		MaxIdleConns           int          `json:"idle_conns"`
 
 		// cont-d
-		ClientAuthTLS   int  `json:"client_auth_tls"`   // #6410 tls.ClientAuthType enum
 		WriteBufferSize int  `json:"write_buffer_size"` // http.Transport.WriteBufferSize; zero defaults to 64KB (`DefaultWriteBufferSize`)
 		ReadBufferSize  int  `json:"read_buffer_size"`  // http.Transport.ReadBufferSize; ditto (`DefaultReadBufferSize`)
 		UseHTTPS        bool `json:"use_https"`         // use HTTPS
 		SkipVerifyCrt   bool `json:"skip_verify"`       // skip X.509 cert verification (used with self-signed certs)
 		Chunked         bool `json:"chunked_transfer"`  // (https://tools.ietf.org/html/rfc7230#page-36; not used since 02/23)
+
+		// Optional TLS overrides for public listeners;
+		// when nil or empty, public listeners use the common net.http TLS configuration.
+		Pub *TLSConf `json:"pub,omitempty"`
 	}
 	HTTPConfToSet struct {
-		Certificate            *string       `json:"server_crt,omitempty"`
-		CertKey                *string       `json:"server_key,omitempty"`
+		*TLSConfToSet          `json:",inline"`
 		ServerNameTLS          *string       `json:"domain_tls,omitempty"`
-		ClientCA               *string       `json:"client_ca_tls,omitempty"`
 		IdleConnTimeout        *cos.Duration `json:"idle_conn_time,omitempty"`
 		BackendIdleConnTimeout *cos.Duration `json:"backend_idle_conn_time,omitempty"`
 		MaxIdleConnsPerHost    *int          `json:"idle_conns_per_host,omitempty"`
 		MaxIdleConns           *int          `json:"idle_conns,omitempty"`
 		// cont-d
-		WriteBufferSize *int  `json:"write_buffer_size,omitempty" list:"readonly"`
-		ReadBufferSize  *int  `json:"read_buffer_size,omitempty" list:"readonly"`
-		ClientAuthTLS   *int  `json:"client_auth_tls,omitempty"`
-		UseHTTPS        *bool `json:"use_https,omitempty"`
-		SkipVerifyCrt   *bool `json:"skip_verify,omitempty"`
-		Chunked         *bool `json:"chunked_transfer,omitempty"`
+		WriteBufferSize *int          `json:"write_buffer_size,omitempty" list:"readonly"`
+		ReadBufferSize  *int          `json:"read_buffer_size,omitempty" list:"readonly"`
+		UseHTTPS        *bool         `json:"use_https,omitempty"`
+		SkipVerifyCrt   *bool         `json:"skip_verify,omitempty"`
+		Chunked         *bool         `json:"chunked_transfer,omitempty"`
+		Pub             *TLSConfToSet `json:"pub,omitempty"`
 	}
 
 	FSHCConf struct {
@@ -955,6 +975,45 @@ type (
 	ArchConf      struct{ XactConf }
 	ArchConfToSet struct{ XactConfToSet }
 
+	// list-objects (x-lso)
+	LsoConf struct {
+		// stream bundle multiplier, et. al - the common knobs
+		// included by all xactions that generate intra-cluster traffic
+		//
+		// Unlike TCB/TCO/Arch, list-objects defaults to a *single*
+		// stream per destination (SbundleMult = 1): the traffic is control-plane-ish
+		// (msgp-packed commonly 1000-entries pages), not bulk data.
+		XactConf
+
+		// Capacity of the channel that buffers object entries produced by
+		// `fs.WalkBck` ahead of the caller reading the next page.
+		// Larger values smooth out bursty walks at the cost of memory;
+		// smaller values apply backpressure to the walker sooner.
+		// Note: counts entries, not pages.
+		// If 0, the system default (below) is used.
+		WalkBuffer int `json:"walk_buffer"`
+
+		// Idle timeout for the x-lso demand xaction: how long a listing
+		// session survives without a next-page request before it self-terminates.
+		// Must exceed the client's think-time between pages, or long-running
+		// paginated listings will hit `ErrGone` and restart from scratch.
+		// If 0, the system default (below) is used.
+		IdleTime cos.Duration `json:"idle_time"`
+
+		// Postponed-cleanup interval: when a listing that used remote paging
+		// finishes, `UnregRecv` is deferred by this duration to absorb in-flight
+		// pages from peer targets. Also the floor for `resetIdle`.
+		// If 0, the system default (below) is used.
+		QuiesceTime cos.Duration `json:"quiescent"`
+	}
+	// LsoConfToSet is the partial-update counterpart of LsoConf.
+	LsoConfToSet struct {
+		XactConfToSet
+		WalkBuffer  *int          `json:"walk_buffer,omitempty"` // +gen:optional
+		IdleTime    *cos.Duration `json:"idle_time,omitempty"`   // +gen:optional
+		QuiesceTime *cos.Duration `json:"quiescent,omitempty"`   // +gen:optional
+	}
+
 	WritePolicyConf struct {
 		Data apc.WritePolicy `json:"data"`
 		MD   apc.WritePolicy `json:"md"`
@@ -969,6 +1028,25 @@ type (
 		MD *apc.WritePolicy `json:"md,omitempty"` // +gen:optional
 	}
 )
+
+// Default-omittable (`defaultOmittable`) sections:
+// - must contain only value types (no maps, slices, pointers)
+// - see PruneOmittables() that validates a shallow scratch copy (and note: section.Validate() mutates the section)
+// - NOTE: when adding a new implementation below, add the section name to `expectedOmittable` in the cmn/prune_defaults_internal_test.go
+type (
+	defaultOmittable interface {
+		validator
+		defaultOmittable()
+	}
+)
+
+func (*TCBConf) defaultOmittable()    {}
+func (*TCOConf) defaultOmittable()    {}
+func (*ArchConf) defaultOmittable()   {}
+func (*LsoConf) defaultOmittable()    {}
+func (*ChunksConf) defaultOmittable() {}
+func (*ECConf) defaultOmittable()     {}
+func (*MirrorConf) defaultOmittable() {}
 
 // global config that can be used to manage:
 // * adaptive rate limit vis-à-vis Cloud backend
@@ -1073,7 +1151,7 @@ type (
 		// Helps reduce cold-read latency by pre-loading file data into memory.
 		// Always auto-disabled under extreme system load.
 		// - (-1): disabled
-		// - 0:    default (enabled w/ 2 workers)
+		// - 0:    default (currently disabled; resolves to -1)
 		// - >0:   enabled with N workers
 		NumWarmupWorkers int `json:"warmup_workers,omitempty"`
 
@@ -1164,6 +1242,7 @@ var (
 	_ validator = (*TCBConf)(nil)
 	_ validator = (*TCOConf)(nil)
 	_ validator = (*ArchConf)(nil)
+	_ validator = (*LsoConf)(nil)
 	_ validator = (*WritePolicyConf)(nil)
 	_ validator = (*TracingConf)(nil)
 	_ validator = (*GetBatchConf)(nil)
@@ -1223,7 +1302,8 @@ func (c *Config) Validate() error {
 	if err := c.LocalConfig.TestFSP.Validate(c); err != nil {
 		return err
 	}
-	if err := c.Features.Validate(); err != nil {
+	// a) features vs other features b) features and vs other config
+	if err := c.Features.ValidateAsProps(c.Auth.RequiresProxyMediation()); err != nil {
 		return err
 	}
 
@@ -1709,12 +1789,20 @@ func (c *VersionConf) String() string {
 // MirrorConf //
 ////////////////
 
+const (
+	mirrorCopiesDflt = 2
+)
+
 func (c *MirrorConf) Validate() error {
-	if c.Burst < 0 {
-		return fmt.Errorf("invalid mirror.burst_buffer: %v (expected >0)", c.Burst)
+	if c.Copies == 0 {
+		c.Copies = mirrorCopiesDflt
+	} else if c.Copies < 2 || c.Copies > 32 {
+		return fmt.Errorf("invalid mirror.copies: %d (expected value in range [2, 32] or zero for default)", c.Copies)
 	}
-	if c.Copies < 2 || c.Copies > 32 {
-		return fmt.Errorf("invalid mirror.copies: %d (expected value in range [2, 32])", c.Copies)
+	if c.Burst == 0 {
+		c.Burst = XactBurstDflt
+	} else if c.Burst < 0 {
+		return fmt.Errorf("invalid mirror.burst_buffer: %v (expected a positive integer or zero for default)", c.Burst)
 	}
 	return nil
 }
@@ -1741,52 +1829,55 @@ func (c *MirrorConf) String() string {
 const (
 	ObjSizeToAlwaysReplicate = -1 // (that's when we have monolithic objects; see `ObjSizeLimit` comment above)
 
-	MinSliceCount = 1  // minimum number of data or parity slices
-	MaxSliceCount = 32 // maximum --/--
+	ecObjSizeLimitDflt = 256 * cos.KiB
+	ecDataSlicesDflt   = 2
+	ecParitySlicesDflt = 2
+
+	MinSliceCount = 1
+	MaxSliceCount = 32
 )
 
 func (c *ECConf) Validate() error {
+	// An empty section means production defaults. In a populated section,
+	// ObjSizeLimit == 0 retains its documented meaning: EC every object.
+	if *c == (ECConf{}) {
+		c.ObjSizeLimit = ecObjSizeLimitDflt
+	}
+
 	if c.ObjSizeLimit < 0 && c.ObjSizeLimit != ObjSizeToAlwaysReplicate {
 		return fmt.Errorf("invalid ec.objsize_limit: %d (expecting an integer greater than or equal to -1)", c.ObjSizeLimit)
 	}
-	if c.DataSlices < MinSliceCount || c.DataSlices > MaxSliceCount {
-		err := fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])",
-			c.DataSlices, MinSliceCount, MaxSliceCount)
-		return err
+	if c.DataSlices == 0 {
+		c.DataSlices = ecDataSlicesDflt
+	} else if c.DataSlices < MinSliceCount || c.DataSlices > MaxSliceCount {
+		return fmt.Errorf("invalid ec.data_slices: %d (expected value in range [%d, %d])", c.DataSlices, MinSliceCount, MaxSliceCount)
 	}
-	if c.ParitySlices < MinSliceCount || c.ParitySlices > MaxSliceCount {
-		return fmt.Errorf("invalid ec.parity_slices: %d (expected value in range [%d, %d])",
-			c.ParitySlices, MinSliceCount, MaxSliceCount)
+	if c.ParitySlices == 0 {
+		c.ParitySlices = ecParitySlicesDflt
+	} else if c.ParitySlices < MinSliceCount || c.ParitySlices > MaxSliceCount {
+		return fmt.Errorf("invalid ec.parity_slices: %d (expected value in range [%d, %d])", c.ParitySlices, MinSliceCount, MaxSliceCount)
 	}
-	if c.SbundleMult < 0 || c.SbundleMult > 16 {
-		return fmt.Errorf("invalid ec.bundle_multiplier: %v (expected range [0, 16])", c.SbundleMult)
-	}
-	if !apc.IsValidCompression(c.Compression) {
-		return fmt.Errorf("invalid ec.compression: %q (expecting one of: %v)", c.Compression, apc.SupportedCompression)
-	}
-	return nil
+
+	return c.XactConf.Validate()
 }
 
-func (c *ECConf) ValidateAsProps(arg ...any) (err error) {
+func (c *ECConf) ValidateAsProps(arg ...any) error {
 	if !c.Enabled {
-		return
+		return nil
 	}
-	if err = c.Validate(); err != nil {
-		return
+	if err := c.Validate(); err != nil {
+		return err
 	}
 	targetCnt, ok := arg[0].(int)
 	debug.Assert(ok)
 	required := c.numRequiredTargets()
 	if required <= targetCnt {
-		return
+		return nil
 	}
 
-	err = fmt.Errorf("%v: EC configuration (D = %d, P = %d) requires at least %d targets (have %d)",
-		ErrNotEnoughTargets, c.DataSlices, c.ParitySlices, required, targetCnt)
-	if c.ObjSizeLimit == ObjSizeToAlwaysReplicate || c.ParitySlices > targetCnt {
-		return
-	}
-	return NewErrWarning(err.Error())
+	s := fmt.Sprintf("EC configuration (D = %d, P = %d) requires at least %d targets (have %d)",
+		c.DataSlices, c.ParitySlices, required, targetCnt)
+	return NewErrNotEnoughTargets(s)
 }
 
 func (c *ECConf) String() string {
@@ -1990,10 +2081,6 @@ func (c *NetConf) Validate() (err error) {
 	if c.HTTP.UseHTTPS {
 		c.HTTP.Proto = "https"
 	}
-	if c.HTTP.ClientAuthTLS < int(tls.NoClientCert) || c.HTTP.ClientAuthTLS > int(tls.RequireAndVerifyClientCert) {
-		return fmt.Errorf("invalid client_auth_tls %d (expecting range [0 - %d])", c.HTTP.ClientAuthTLS,
-			tls.RequireAndVerifyClientCert)
-	}
 	return nil
 }
 
@@ -2031,7 +2118,33 @@ func (c *HTTPConf) Validate() error {
 	if n := min(c.MaxIdleConns, dfltMaxIdlePerHost); c.MaxIdleConnsPerHost != 0 && c.MaxIdleConnsPerHost > n {
 		return fmt.Errorf("invalid idle_conns_per_host: %d (expecting range [0 - %d])", c.MaxIdleConnsPerHost, n)
 	}
-	return nil
+
+	// must be done before TLSConf.Validate (below)
+	if c.UseHTTPS {
+		const hint = " (set server_crt and server_key first, then enable use_https)"
+		if c.Certificate == "" {
+			return errors.New("net.http.server_crt required when use_https=true" + hint)
+		}
+		if c.CertKey == "" {
+			return errors.New("net.http.server_key required when use_https=true" + hint)
+		}
+	}
+	if err := c.TLSConf.Validate("net.http"); err != nil {
+		return err
+	}
+
+	if c.Pub == nil {
+		return nil
+	}
+
+	// pub TLS overrides: all-or-nothing section; when disabled, no stray settings
+	if c.Pub.Certificate == "" && c.Pub.CertKey == "" {
+		if c.Pub.ClientCA != "" || c.Pub.ClientAuthTLS != 0 {
+			return errors.New("net.http.pub: client_ca_tls and/or client_auth_tls require pub server_crt and server_key")
+		}
+		return nil
+	}
+	return c.Pub.Validate("net.http.pub")
 }
 
 // used intra-clients; see related: EnvToTLS()
@@ -2042,6 +2155,29 @@ func (c *HTTPConf) ToTLS() TLSArgs {
 		ClientCA:    c.ClientCA,
 		SkipVerify:  c.SkipVerifyCrt,
 	}
+}
+
+/////////////
+// TLSConf //
+/////////////
+
+func (c *TLSConf) Enabled() bool {
+	return c != nil && c.Certificate != "" && c.CertKey != ""
+}
+
+func (c *TLSConf) Validate(tag string) error {
+	if (c.Certificate == "") != (c.CertKey == "") {
+		return fmt.Errorf("%s: both server_crt and server_key must be set (or neither)", tag)
+	}
+	if c.ClientAuthTLS < int(tls.NoClientCert) || c.ClientAuthTLS > int(tls.RequireAndVerifyClientCert) {
+		return fmt.Errorf("%s: invalid client_auth_tls %d (expecting range [0 - %d])",
+			tag, c.ClientAuthTLS, tls.RequireAndVerifyClientCert)
+	}
+	if tls.ClientAuthType(c.ClientAuthTLS) >= tls.VerifyClientCertIfGiven && c.ClientCA == "" {
+		return fmt.Errorf("%s: client_ca_tls required when client_auth_tls >= %d (got %d)",
+			tag, int(tls.VerifyClientCertIfGiven), c.ClientAuthTLS)
+	}
+	return nil
 }
 
 //////////////
@@ -2130,6 +2266,7 @@ func (c *AuthConf) CopyTo(dst *AuthConf) {
 	}
 }
 
+// TODO: [backward compatibility] remove in 5.1 along with all call sites
 func IsV50Bridge() bool { return strings.HasPrefix(VersionAIStore, "5.0") }
 
 func (c *AuthConf) IntraClusterConfigured() bool {
@@ -2138,6 +2275,12 @@ func (c *AuthConf) IntraClusterConfigured() bool {
 
 func (c *AuthConf) SignVerifyEnabled() bool {
 	return c.IntraClusterConfigured() && !IsV50Bridge()
+}
+
+// Starting with v5.0, direct access to AIS targets is rejected when either AuthN
+// or intra-cluster request signing is configured: both require proxy mediation.
+func (c *AuthConf) RequiresProxyMediation() bool {
+	return c.Enabled || c.IntraClusterConfigured()
 }
 
 func (c *AuthConf) Validate() error {
@@ -2162,7 +2305,7 @@ func (c *AuthConf) Validate() error {
 	if sigConfigured && oidcConfigured {
 		return errors.New("invalid auth config: only one of signature or OIDC config should be provided")
 	}
-	if c.SignVerifyEnabled() {
+	if c.IntraCluster != nil {
 		return c.IntraCluster.validate()
 	}
 	return nil
@@ -2320,68 +2463,197 @@ func (c *IntraClusterConf) validate() error {
 	return nil
 }
 
+/////////////
+// LsoConf //
+/////////////
+
+const (
+	lsoSbundleMultDflt = 1  // control-plane-ish: one stream per destination
+	lsoBurstDflt       = 32 // was xact/xs/lso.go remtPageChSize (16); raised to xactBurstMin
+
+	lsoWalkBufDflt = 128 // TODO remove xact/xs/lso.go pageChSize
+	lsoWalkBufMin  = 16
+	lsoWalkBufMax  = 4096
+
+	lsoIdleDflt = 20 * time.Second // TODO: remove/replace timeout.max_host_busy
+	lsoIdleMin  = 5 * time.Second
+	lsoIdleMax  = 10 * time.Minute
+
+	lsoQuiesceDflt = 5 * time.Second // TODO: remove timeout.max_keepalive
+	lsoQuiesceMin  = 2 * time.Second
+	lsoQuiesceMax  = time.Minute
+)
+
+func (c *LsoConf) Validate() error {
+	debug.Assert(lsoQuiesceDflt < lsoIdleDflt)
+
+	c.SbundleMult = cos.NonZero(c.SbundleMult, lsoSbundleMultDflt)
+	c.Burst = cos.NonZero(c.Burst, lsoBurstDflt)
+
+	if err := c.XactConf.Validate(); err != nil { // note: calling explicitly and _after_ c.SbundleMult
+		return err
+	}
+	if c.WalkBuffer == 0 {
+		c.WalkBuffer = lsoWalkBufDflt
+	} else if c.WalkBuffer < lsoWalkBufMin || c.WalkBuffer > lsoWalkBufMax {
+		return fmt.Errorf("invalid lso.walk_buffer=%d (expecting 0 for default, or range [%d, %d])",
+			c.WalkBuffer, lsoWalkBufMin, lsoWalkBufMax)
+	}
+	if c.IdleTime == 0 {
+		c.IdleTime = cos.Duration(lsoIdleDflt)
+	} else if c.IdleTime.D() < lsoIdleMin || c.IdleTime.D() > lsoIdleMax {
+		return fmt.Errorf("invalid lso.idle_time=%s (expecting 0 for default, or range [%v, %v])",
+			c.IdleTime, lsoIdleMin, lsoIdleMax)
+	}
+	if c.QuiesceTime == 0 {
+		c.QuiesceTime = cos.Duration(lsoQuiesceDflt)
+	} else if c.QuiesceTime.D() < lsoQuiesceMin || c.QuiesceTime.D() > lsoQuiesceMax {
+		return fmt.Errorf("invalid lso.quiescent=%s (expecting 0 for default, or range [%v, %v])",
+			c.QuiesceTime, lsoQuiesceMin, lsoQuiesceMax)
+	}
+	if c.QuiesceTime >= c.IdleTime {
+		return fmt.Errorf("invalid lso.quiescent=%s: must be less than lso.idle_time=%s", c.QuiesceTime, c.IdleTime)
+	}
+	return nil
+}
+
 ////////////////////
 // LocalNetConfig //
 ////////////////////
 
 const HostnameListSepa = ","
 
-func (c *LocalNetConfig) Validate(contextConfig *Config) error {
+// NOTE 5.0 update:
+// - intra-net is mandatory and must be separate from pub-net
+// - control/data may collapse: when data is omitted, it uses control, and vice versa
+// - 3 physically-separate (bandwidth-isolated) networks are strongly recommended
+func (c *LocalNetConfig) Validate(_ *Config) error {
 	c.Hostname = strings.ReplaceAll(c.Hostname, " ", "")
 	c.HostnameIntraControl = strings.ReplaceAll(c.HostnameIntraControl, " ", "")
 	c.HostnameIntraData = strings.ReplaceAll(c.HostnameIntraData, " ", "")
 
-	if addr, over := ipsOverlap(c.Hostname, c.HostnameIntraControl); over {
-		if c.Port == c.PortIntraControl {
-			return fmt.Errorf("public (%s) and intra-cluster control (%s) share the same IP and port: %s:%d",
-				c.Hostname, c.HostnameIntraControl, addr, c.Port)
-		}
-		nlog.Warningf("public (%s) and intra-cluster control (%s) share the same IP: %q",
-			c.Hostname, c.HostnameIntraControl, addr)
-	}
-	if addr, over := ipsOverlap(c.Hostname, c.HostnameIntraData); over {
-		if c.Port == c.PortIntraData {
-			return fmt.Errorf("public (%s) and intra-cluster data (%s) share the same IP and port: %s:%d",
-				c.Hostname, c.HostnameIntraData, addr, c.Port)
-		}
-		nlog.Warningf("public (%s) and intra-cluster data (%s) share the same IP: %q",
-			c.Hostname, c.HostnameIntraData, addr)
-	}
-	if addr, over := ipsOverlap(c.HostnameIntraControl, c.HostnameIntraData); over {
-		if ipv4ListsEqual(c.HostnameIntraControl, c.HostnameIntraData) {
-			nlog.Warningln("control and data share the same intra-cluster network:", c.HostnameIntraData)
-		} else {
-			nlog.Warningf("intra-cluster control (%s) and data (%s) share the same: %q",
-				c.HostnameIntraControl, c.HostnameIntraData, addr)
-		}
-	}
-
-	// Parse ports
+	// 1. Validate public port.
 	if _, err := ValidatePort(c.Port); err != nil {
 		return fmt.Errorf("invalid %s port: %w", NetPublic, err)
 	}
-	if c.PortIntraControl != 0 {
-		if _, err := ValidatePort(c.PortIntraControl); err != nil {
-			return fmt.Errorf("invalid %s port: %w", NetIntraControl, err)
-		}
+
+	// 2. Reject intra-net multi-homing
+	const fmterr = "%s hostname must be a single IP/hostname, not a comma-separated list %q (multi-homing is only supported for %s)"
+	if strings.Contains(c.HostnameIntraControl, HostnameListSepa) {
+		return fmt.Errorf(fmterr, NetIntraControl, c.HostnameIntraControl, NetPublic)
 	}
-	if c.PortIntraData != 0 {
-		if _, err := ValidatePort(c.PortIntraData); err != nil {
-			return fmt.Errorf("invalid %s port: %w", NetIntraData, err)
-		}
+	if strings.Contains(c.HostnameIntraData, HostnameListSepa) {
+		return fmt.Errorf(fmterr, NetIntraData, c.HostnameIntraData, NetPublic)
 	}
 
-	// NOTE: intra-cluster networks
-	differentIPs := c.Hostname != c.HostnameIntraControl
-	differentPorts := c.Port != c.PortIntraControl
-	c.UseIntraControl = (contextConfig.TestingEnv() || c.HostnameIntraControl != "") &&
-		c.PortIntraControl != 0 && (differentIPs || differentPorts)
+	// 3. Intra-net is mandatory and must be separate from pub-net.
+	//    Control/data may collapse: when data is omitted, it uses control, and vice versa.
+	c.UseIntraControl, c.UseIntraData = true, false
+	collapsed := false
+	if c.PortIntraControl == 0 {
+		if c.HostnameIntraControl != "" {
+			return fmt.Errorf("%s hostname is configured but port is missing", NetIntraControl)
+		}
+		if c.PortIntraData == 0 {
+			return fmt.Errorf("at least one port - %s or %s - must be configured; intra-cluster network must be separate from %s",
+				NetIntraControl, NetIntraData, NetPublic)
+		}
+		c.HostnameIntraControl = c.HostnameIntraData
+		c.PortIntraControl = c.PortIntraData
+		collapsed = true
+		nlog.Warningln(NetIntraControl, "network is not configured; using", NetIntraData)
+	}
+	if c.PortIntraData == 0 {
+		if c.HostnameIntraData != "" {
+			return fmt.Errorf("%s hostname is configured but port is missing", NetIntraData)
+		}
+		c.HostnameIntraData = c.HostnameIntraControl
+		c.PortIntraData = c.PortIntraControl
+		collapsed = true
+		nlog.Warningln(NetIntraData, "network is not configured; using", NetIntraControl)
+	}
 
-	differentIPs = c.Hostname != c.HostnameIntraData
-	differentPorts = c.Port != c.PortIntraData
-	c.UseIntraData = (contextConfig.TestingEnv() || c.HostnameIntraData != "") &&
-		c.PortIntraData != 0 && (differentIPs || differentPorts)
+	// 4. Validate intra-nets vs pub-net.
+	if err := validatePubIntra(c.Hostname, c.Port, c.HostnameIntraControl, c.PortIntraControl, NetIntraControl); err != nil {
+		return err
+	}
+
+	if c.HostnameIntraData != c.HostnameIntraControl || c.PortIntraData != c.PortIntraControl {
+		if err := validatePubIntra(c.Hostname, c.Port, c.HostnameIntraData, c.PortIntraData, NetIntraData); err != nil {
+			return err
+		}
+		c.UseIntraData = true
+	}
+
+	if collapsed {
+		return nil
+	}
+
+	//  5. Warn intra-net sharing and note different requirements that are NOT getting met:
+	//     (low bandwidth/low contention, optimized latency) vs (high bandwidth, large Tx/Rx buffers, Jumbo), respectively.
+	if c.HostnameIntraControl == c.HostnameIntraData {
+		if c.PortIntraControl == c.PortIntraData {
+			debug.Assert(!c.UseIntraData) // per step 4 above
+			if c.HostnameIntraControl != "" {
+				nlog.Warningf("%s and %s share the same endpoint (%s:%d); using a single (combined) intra-cluster network",
+					NetIntraControl, NetIntraData, c.HostnameIntraControl, c.PortIntraControl)
+			} else {
+				nlog.Warningf("%s and %s share the same endpoint on port %d; using a single (combined) intra-cluster network",
+					NetIntraControl, NetIntraData, c.PortIntraControl)
+			}
+			return nil
+		}
+		if c.HostnameIntraControl != "" {
+			nlog.Warningf("%s and %s share the same network %q with distinct ports: %d and %d, respectively",
+				NetIntraControl, NetIntraData, c.HostnameIntraControl, c.PortIntraControl, c.PortIntraData)
+		}
+	}
 	return nil
+}
+
+//
+// LocalConfig.Validate helpers:
+//
+
+func validatePubIntra(pubHost string, pubPort int, intraHost string, intraPort int, intraNet string) error {
+	if _, err := ValidatePort(intraPort); err != nil {
+		return fmt.Errorf("invalid %s port: %w", intraNet, err)
+	}
+	if pubPort == intraPort {
+		if pubHost == intraHost {
+			return fmt.Errorf("%s must be separate from %s (%s:%d)", intraNet, NetPublic, pubHost, pubPort)
+		}
+		if addr := findOverlappingAddr(pubHost, intraHost); addr != "" {
+			return fmt.Errorf("%s must be separate from %s; both share %s:%d", intraNet, NetPublic, addr, pubPort)
+		}
+	}
+	if addr := findOverlappingAddr(pubHost, intraHost); addr != "" {
+		nlog.Warningf("%s (%s:%d) and %s (%s:%d) share the same IP/host: %q", NetPublic, pubHost, pubPort, intraNet, intraHost, intraPort, addr)
+	}
+
+	return nil
+}
+
+// check if the two comma-separated IP (or hostname) address lists contain at least
+// one common IP (or host)
+func findOverlappingAddr(alist, blist string) (addr string) {
+	if alist == "" || blist == "" {
+		return ""
+	}
+	bset := make(cos.StrSet)
+	for b := range strings.SplitSeq(blist, HostnameListSepa) {
+		b = strings.TrimSpace(b)
+		if b != "" {
+			bset.Set(b)
+		}
+	}
+	for a := range strings.SplitSeq(alist, HostnameListSepa) {
+		a = strings.TrimSpace(a)
+		if bset.Contains(a) {
+			return a
+		}
+	}
+	return ""
 }
 
 /////////////
@@ -2607,14 +2879,6 @@ const (
 	xactSbundleMultMin  = 1
 	xactSbundleMultMax  = 16
 )
-
-func DefaultXactConf() XactConf {
-	return XactConf{
-		Compression: XactCompressionDflt,
-		SbundleMult: XactSbundleMultDflt,
-		Burst:       XactBurstDflt,
-	}
-}
 
 func (c *XactConf) Validate() error {
 	if c.Compression == "" {
@@ -2888,12 +3152,12 @@ func (c *RateLimitConf) ValidateAsProps(...any) error { return c.Validate() }
 //////////////////
 
 const (
-	getBatchWaitDflt = 30 * time.Second
+	getBatchWaitDflt = 20 * time.Second
 	GetBatchWaitMin  = time.Second
 	getBatchWaitMax  = time.Minute
 
 	numWarmupWorkersDisabled = -1
-	numWarmupWorkersDflt     = 2
+	numWarmupWorkersDflt     = numWarmupWorkersDisabled
 
 	getBatchSoftErrsDflt = 8
 	getBatchMaxGFN       = 5
@@ -2908,6 +3172,12 @@ func (c *GetBatchConf) IsDisabledGFN() bool { return c.MaxGFN == getBatchDisable
 
 func (c *GetBatchConf) Validate() error {
 	debug.Assert(numWarmupWorkersDisabled < 0 && getBatchWaitDflt > GetBatchWaitMin && GetBatchWaitMin < getBatchWaitMax)
+	debug.Assert(getBatchWaitDflt <= getBatchWaitMax)
+
+	if err := c.XactConf.Validate(); err != nil {
+		return err
+	}
+
 	if c.MaxWait == 0 {
 		c.MaxWait = cos.Duration(getBatchWaitDflt)
 	} else if c.MaxWait.D() < GetBatchWaitMin || c.MaxWait.D() > getBatchWaitMax {
@@ -2919,7 +3189,8 @@ func (c *GetBatchConf) Validate() error {
 		c.NumWarmupWorkers = numWarmupWorkersDflt
 	default:
 		if c.NumWarmupWorkers < 0 || c.NumWarmupWorkers > 10 {
-			return fmt.Errorf("invalid get_batch.warmup_workers=%d (expecting range [%d, %d])", c.NumWarmupWorkers, 0, 10)
+			return fmt.Errorf("invalid get_batch.warmup_workers=%d (expecting %d to disable, 0 for default, or range [1, 10])",
+				c.NumWarmupWorkers, numWarmupWorkersDisabled)
 		}
 	}
 	if c.MaxSoftErrs == 0 {
@@ -2941,49 +3212,9 @@ func (c *GetBatchConf) Validate() error {
 }
 
 //
-// misc config utilities ---------------------------------------------------------
+// main function: is called at startup, just once
 //
 
-// checks if the two comma-separated IPv4 address lists contain at least one common IPv4
-func ipsOverlap(alist, blist string) (addr string, overlap bool) {
-	if alist == "" || blist == "" {
-		return
-	}
-	for a := range strings.SplitSeq(alist, HostnameListSepa) {
-		a = strings.TrimSpace(a)
-		if a == "" {
-			continue
-		}
-		if strings.Contains(blist, a) {
-			return a, true
-		}
-	}
-	return
-}
-
-func ipv4ListsEqual(alist, blist string) bool {
-	alistAddrs := strings.Split(alist, ",")
-	blistAddrs := strings.Split(blist, ",")
-	f := func(in []string) (out []string) {
-		out = make([]string, 0, len(in))
-		for _, i := range in {
-			i = strings.TrimSpace(i)
-			if i == "" {
-				continue
-			}
-			out = append(out, i)
-		}
-		return
-	}
-	al := f(alistAddrs)
-	bl := f(blistAddrs)
-	if len(al) == 0 || len(bl) == 0 || len(al) != len(bl) {
-		return false
-	}
-	return cos.StrSlicesEqual(al, bl)
-}
-
-// is called at startup
 func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) error {
 	debug.Assert(globalConfPath != "" && localConfPath != "")
 	GCO.SetInitialGconfPath(globalConfPath)
@@ -3039,6 +3270,7 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	}
 
 	// initialize atomic part of the config including most often used timeouts and features
+	debug.Assert(onSignVerifyToggle == nil, "startup sequence: must not trigger runtime sign/verify hook")
 	Rom.Set(&config.ClusterConfig)
 	Rom.testingEnv = config.TestingEnv()
 

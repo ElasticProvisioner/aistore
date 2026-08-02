@@ -97,7 +97,8 @@ func (m *mgr) updateSignerBundle(signer tok.Signer) {
 	m.sb.Store(&signerBundle{signer: signer, parser: parser})
 }
 
-func (m *mgr) validateToken(ctx context.Context, token string) (*tok.AISClaims, error) {
+// Signature and claims only — does not consult the revoked-tokens list.
+func (m *mgr) validateTokenSignature(ctx context.Context, token string) (*tok.AISClaims, error) {
 	return m.getParser().ValidateToken(ctx, token)
 }
 
@@ -275,6 +276,7 @@ func (m *mgr) addRole(info *authn.Role) (int, error) {
 	if info.IsAdmin {
 		return http.StatusForbidden, fmt.Errorf("only built-in roles can have %q permissions", adminUserID)
 	}
+	sanitizeRoleACLs(info)
 
 	m.authzMu.Lock()
 	defer m.authzMu.Unlock()
@@ -319,8 +321,8 @@ func (m *mgr) updateRole(role string, updateReq *authn.Role) (int, error) {
 	if updateReq.Description != "" {
 		rInfo.Description = updateReq.Description
 	}
-	rInfo.ClusterACLs = mergeClusterACLs(rInfo.ClusterACLs, updateReq.ClusterACLs, "")
-	rInfo.BucketACLs = mergeBckACLs(rInfo.BucketACLs, updateReq.BucketACLs, "")
+	rInfo.ClusterACLs = authn.MergeClusterACLs(rInfo.ClusterACLs, updateReq.ClusterACLs, "", false /*union*/)
+	rInfo.BucketACLs = authn.MergeBckACLs(rInfo.BucketACLs, updateReq.BucketACLs, "", false /*union*/)
 
 	if code, err := m.db.Set(rolesCollection, role, rInfo); err != nil {
 		return code, err
@@ -352,6 +354,12 @@ func (m *mgr) roleList() ([]*authn.Role, int, error) {
 		roles = append(roles, role)
 	}
 	return roles, http.StatusOK, nil
+}
+
+// Drop nil entries from role ACLs
+func sanitizeRoleACLs(role *authn.Role) {
+	role.ClusterACLs = slices.DeleteFunc(role.ClusterACLs, func(acl *authn.CluACL) bool { return acl == nil })
+	role.BucketACLs = slices.DeleteFunc(role.BucketACLs, func(acl *authn.BckACL) bool { return acl == nil })
 }
 
 // Creates predefined roles for newly-added clusters
@@ -520,7 +528,6 @@ func (m *mgr) delCluster(cluID string) (int, error) {
 func (m *mgr) issueToken(uid, pwd string, msg *authn.LoginMsg) (token string, code int, err error) {
 	var (
 		uInfo   = &authn.User{}
-		cid     string
 		cluACLs []*authn.CluACL
 		bckACLs []*authn.BckACL
 	)
@@ -538,8 +545,8 @@ func (m *mgr) issueToken(uid, pwd string, msg *authn.LoginMsg) (token string, co
 
 	// update ACLs with roles' ones
 	for _, role := range uInfo.Roles {
-		cluACLs = mergeClusterACLs(cluACLs, role.ClusterACLs, cid)
-		bckACLs = mergeBckACLs(bckACLs, role.BucketACLs, cid)
+		cluACLs = authn.MergeClusterACLs(cluACLs, role.ClusterACLs, "", true /*union*/)
+		bckACLs = authn.MergeBckACLs(bckACLs, role.BucketACLs, "", true /*union*/)
 	}
 
 	claims, err := m.buildClaims(msg, uInfo, cluACLs, bckACLs)
@@ -678,6 +685,31 @@ func (m *mgr) getAllClusterIDs() ([]string, error) {
 	return ids, nil
 }
 
+// Validates signature and that the token is not in the revoked list.
+func (m *mgr) validateToken(ctx context.Context, token string) (*tok.AISClaims, error) {
+	revoked, err := m.isTokenRevoked(token)
+	if err != nil {
+		return nil, err
+	}
+	if revoked {
+		return nil, fmt.Errorf("%w: %w", tok.ErrInvalidToken, tok.ErrTokenRevoked)
+	}
+	return m.validateTokenSignature(ctx, token)
+}
+
+// Reports whether the token was revoked.
+// Fails closed: a DB error other than "not found" denies authorization.
+func (m *mgr) isTokenRevoked(token string) (bool, error) {
+	_, _, err := m.db.GetString(revokedCollection, token)
+	if err == nil {
+		return true, nil
+	}
+	if cos.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 // Add the given token to the revoked list within AuthN
 // In the background, attempt to delete the token from all clusters
 func (m *mgr) revokeToken(token string) (int, error) {
@@ -702,7 +734,7 @@ func (m *mgr) generateRevokedTokenList(ctx context.Context) ([]string, int, erro
 
 	revokeList := make([]string, 0, len(tokens))
 	for _, token := range tokens {
-		_, err = m.validateToken(ctx, token)
+		_, err = m.validateTokenSignature(ctx, token)
 		if err != nil {
 			nlog.Infof("removing invalid token %q due to validation error %v", token, err)
 			_, err = m.db.Delete(revokedCollection, token)

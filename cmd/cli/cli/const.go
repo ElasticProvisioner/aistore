@@ -195,6 +195,7 @@ const (
 	cmdAuthRemove    = commandRemove
 	cmdAuthLogin     = "login"
 	cmdAuthLogout    = "logout"
+	cmdAuthWhoami    = "whoami"
 	cmdAuthUser      = "user"
 	cmdAuthRole      = "role"
 	cmdAuthCluster   = cmdCluster
@@ -205,15 +206,11 @@ const (
 	cmdAuthPubKey    = apc.PubKey
 	cmdAuthRotateKey = apc.Rotate
 
-	// K8s subcommans
-	cmdK8s        = "kubectl"
-	cmdK8sSvc     = "svc"
-	cmdK8sCluster = commandCluster
-
 	// ETL subcommands
-	cmdInit   = "init"
-	cmdSpec   = "spec"
-	cmdErrors = "errors"
+	cmdInit    = "init"
+	cmdInspect = "inspect"
+	cmdSpec    = "spec"
+	cmdErrors  = "errors"
 
 	// config subcommands
 	cmdCLI        = "cli"
@@ -239,9 +236,6 @@ const (
 	refreshRateMinDur  = time.Second
 	countDefault       = 1
 	countUnlimited     = -1
-
-	execLinuxCommandTime     = 5 * time.Second
-	execLinuxCommandTimeLong = 30 * time.Second
 
 	logFlushTime = 10 * time.Second // as the name implies
 
@@ -492,7 +486,7 @@ var (
 	}
 	etlAllObjsFlag = cli.BoolFlag{
 		Name:  scopeAll,
-		Usage: "Transform all objects from a remote bucket including those that are not present (not cached) in cluster",
+		Usage: "Include all objects from a remote bucket including those that are not present (not cached) in cluster",
 	}
 
 	// obj props
@@ -879,7 +873,7 @@ var (
 			indent1 + "\t\t- 'ais bucket props set BUCKET versioning'\n" +
 			indent1 + "\t\t- 'ais ls --check-versions'\n" +
 			indent1 + "\tsupported commands include:\n" +
-			indent1 + "\t\t- 'ais cp', 'ais prefetch', 'ais get', 'ais start rebalance'",
+			indent1 + "\t\t- 'ais cp', 'ais prefetch', 'ais get', 'ais start rebalance', 'ais etl inspect'",
 	}
 	syncFlag = cli.BoolFlag{
 		Name: "sync",
@@ -1325,8 +1319,6 @@ var (
 			indent4 + "\t - 'hpush' or 'hpush://' - ETL container provides HTTP PUT handler that'll be invoked upon every request to transform\n" +
 			indent4 + "\t -  '' - same as 'hpush://' (default, can be omitted)\n" +
 			indent4 + "\t - 'hpull' or 'hpull://' - same, but ETL container is expected to provide HTTP GET endpoint\n" +
-			indent4 + "\t - 'io' or 'io://' - for each request an aistore node will: run ETL container locally, write data\n" +
-			indent4 + "\t   to its standard input and then read transformed data from the standard output\n" +
 			indent4 + "\t For more details, see https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#communication-mechanisms",
 	}
 

@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -85,9 +84,6 @@ func (p *proxy) httpmlget(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if err := p.checkAccess(w, r, nil, apc.AceGET); err != nil {
-		return
-	}
 	if len(items) > 2 || items[0] != apc.Moss {
 		p.writeErrURL(w, r)
 		return
@@ -100,11 +96,11 @@ func (p *proxy) httpmlget(w http.ResponseWriter, r *http.Request) {
 		coloc  apc.ColocLevel
 		dpq    = dpqAlloc()
 	)
+	defer dpqFree(dpq)
 	if err := dpq.parse(r.URL.RawQuery); err != nil {
 		p.writeErr(w, r, err)
 		return
 	}
-	defer dpqFree(dpq)
 
 	if dpq.coloc > 0 {
 		coloc = apc.ColocLevel(dpq.coloc)
@@ -139,36 +135,53 @@ func (p *proxy) httpmlget(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// body
-	body, errB := cmn.ReadBytes(r) // read api.MossReq but not unmarshal it
+	body, errB := cmn.ReadBytes(r)
 	if errB != nil {
 		p.writeErr(w, r, errB)
 		return
 	}
 
-	// DT
+	// streaming pass over the request: collect the distinct referenced buckets
+	// and, when colocation is on, select the DT
 	var (
 		smap = p.owner.smap.get()
 		nat  = smap.CountActiveTs()
-		tsi  *meta.Snode
-		errT error
 	)
-	if coloc >= apc.ColocOne {
-		var req apc.MossReq
-		if err := jsoniter.Unmarshal(body, &req); err != nil {
-			p.writeErr(w, r, err)
-			return
-		}
-		if err := _checkMossEmpty(&req); err != nil {
-			p.writeErr(w, r, err)
-			return
-		}
-		tsi, errT = _selectDT(&req, bck, smap, nat)
-	} else {
-		tsi, errT = smap.HrwTargetTask(cos.GenTie())
-	}
-	if errT != nil {
-		p.writeErr(w, r, errT)
+	iter := jsoniter.ConfigFastest.BorrowIterator(body)
+	bcks, tsi, err := mossScan(iter, bck, smap, nat, coloc)
+	jsoniter.ConfigFastest.ReturnIterator(iter)
+
+	if err != nil {
+		p.writeErr(w, r, err)
 		return
+	}
+	// initialize and authorize (apc.AceGET) every referenced bucket
+	for _, b := range bcks {
+		// skip the path bucket (already initialized and authorized above)
+		if b.Equal(bck, false /*sameID*/, false /*sameBackend*/) {
+			continue
+		}
+		bckArgs := allocBctx()
+		{
+			bckArgs.p = p
+			bckArgs.w = w
+			bckArgs.r = r
+			bckArgs.bck = b
+			bckArgs.perms = apc.AceGET
+			bckArgs.createAIS = false
+		}
+		_, err := bckArgs.initAndTry()
+		freeBctx(bckArgs)
+		if err != nil {
+			return
+		}
+	}
+	// no colocation: pick the DT at random
+	if coloc < apc.ColocOne {
+		if tsi, err = smap.HrwTargetTask(cos.GenTie()); err != nil {
+			p.writeErr(w, r, err)
+			return
+		}
 	}
 
 	raw := r.URL.RawQuery
@@ -218,8 +231,7 @@ func (p *proxy) httpmlget(w http.ResponseWriter, r *http.Request) {
 
 	// phase 2: redirect user's GET => DT
 	r.URL.Path = path
-	started := time.Now()
-	redirectURL := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	redirectURL := p.redurl(r, tsi, smap.Version, cmn.NetIntraControl, "")
 
 	if cmn.Rom.V(5, cos.ModAIS) {
 		nlog.Infoln(r.Method, items, "=> redirect to", tsi.String(), "at", redirectURL)
@@ -239,59 +251,6 @@ func (p *proxy) httpmlget(w http.ResponseWriter, r *http.Request) {
 		// see also ctx._startSend on the target side
 		go p._startSend(args, tsi)
 	}
-}
-
-// proxy: select DT when requested via apc.QparamColoc
-func _selectDT(req *apc.MossReq, dfltBck *meta.Bck, smap *smapX, nat int) (*meta.Snode, error) {
-	var (
-		m      map[string]int // the map of scores or hits: req.In entries => target
-		single string         // when all entries HRW => single target
-		dt     string         // designated target
-		score  int            // max running score
-	)
-	for i := range req.In {
-		var (
-			in  = &req.In[i]
-			err error
-			tsi *meta.Snode
-			bck *meta.Bck
-		)
-		if bck, err = meta.BckFromUBP(in.Uname, in.Bucket, in.Provider); err != nil {
-			return nil, err
-		}
-		if bck == nil {
-			bck = dfltBck
-		}
-		if bck == nil {
-			return nil, fmt.Errorf("missing bucket specification for object %q", in.ObjName)
-		}
-
-		if tsi, err = smap.HrwName2T(bck.MakeUname(in.ObjName)); err != nil {
-			return nil, err
-		}
-		tid := tsi.ID()
-
-		switch {
-		case single == "":
-			single = tid
-			dt = tid
-			score = 1
-		case single == tid && m == nil:
-			score++
-		default:
-			if m == nil {
-				m = make(map[string]int, min(nat, len(req.In)))
-				m[single] = score
-			}
-			m[tid]++
-			if score < m[tid] {
-				score = m[tid]
-				dt = tid
-			}
-		}
-	}
-
-	return smap.GetTarget(dt), nil
 }
 
 // proxy: phase 3 bcast to senders - async and after the phase-2 redirect
@@ -323,13 +282,50 @@ type mossCtx struct {
 	nat  int
 }
 
+func (t *target) _mlVerify(w http.ResponseWriter, r *http.Request, dpq *dpq) bool {
+	switch r.Method {
+	case http.MethodPost:
+		if !t.ensureIntraControl(w, r, false) {
+			return false
+		}
+	case http.MethodGet:
+		// do nothing
+	default:
+		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPost)
+		return false
+	}
+
+	if err := dpq.parse(r.URL.RawQuery); err != nil {
+		t.writeErr(w, r, err)
+		return false
+	}
+
+	if r.Method == http.MethodGet {
+		// phase 2 redirect over pub-net
+		if ecode, err := t.verifyRedirect(r, dpq); err != nil {
+			t.writeErr(w, r, err, ecode)
+			return false
+		}
+	}
+	return true
+}
+
 func (t *target) mlHandler(w http.ResponseWriter, r *http.Request) {
+	var (
+		ctx mossCtx
+		dpq = dpqAlloc()
+	)
+	defer dpqFree(dpq)
+
+	if !t._mlVerify(w, r, dpq) {
+		return
+	}
+
 	switch r.Method {
 	// phase 1: DT to initialize Rx (see `designated`)
 	// phase 3: senders to open SDM and start sending
 	case http.MethodPost:
-		var ctx mossCtx
-		if err := t.mossparse(w, r, &ctx); err != nil {
+		if err := t.mossparse(w, r, &ctx, dpq); err != nil {
 			return
 		}
 		ctx.t = t
@@ -366,8 +362,7 @@ func (t *target) mlHandler(w http.ResponseWriter, r *http.Request) {
 
 	// phase 2: redirect - ready to start assembly, waiting for the phase 3
 	case http.MethodGet:
-		var ctx mossCtx
-		if err := t.mossparse(w, r, &ctx); err != nil {
+		if err := t.mossparse(w, r, &ctx, dpq); err != nil {
 			return
 		}
 		ctx.t = t
@@ -398,8 +393,6 @@ func (t *target) mlHandler(w http.ResponseWriter, r *http.Request) {
 				t.writeErr(w, r, err, 0, Silent)
 			}
 		}
-	default:
-		cmn.WriteErr405(w, r, http.MethodGet)
 	}
 }
 
@@ -538,11 +531,9 @@ func _checkMossEmpty(req *apc.MossReq) (err error) {
 }
 
 // parse tmosspath()
-func (t *target) mossparse(w http.ResponseWriter, r *http.Request, ctx *mossCtx) (err error) {
-	var (
-		items []string
-	)
-	if items, err = t.parseURL(w, r, apc.URLPathML.L, 4, true); err != nil {
+func (t *target) mossparse(w http.ResponseWriter, r *http.Request, ctx *mossCtx, dpq *dpq) error {
+	items, err := t.parseURL(w, r, apc.URLPathML.L, 4, true)
+	if err != nil {
 		return err
 	}
 	if cmn.Rom.V(5, cos.ModAIS) {
@@ -573,13 +564,6 @@ func (t *target) mossparse(w http.ResponseWriter, r *http.Request, ctx *mossCtx)
 		return err
 	}
 	debug.Assert(ctx.nat > 0 && ctx.nat < 10_000, ctx.nat)
-
-	dpq := dpqAlloc()
-	defer dpqFree(dpq)
-	if err := dpq.parse(r.URL.RawQuery); err != nil {
-		t.writeErr(w, r, err)
-		return err
-	}
 
 	ctx.tid = dpq.get(apc.QparamTID)
 	if ctx.tid != "" {

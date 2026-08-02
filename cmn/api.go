@@ -49,6 +49,10 @@ const (
 	PropBackendBck         = "backend_bck"
 	PropBackendBckName     = PropBackendBck + ".name"
 	PropBackendBckProvider = PropBackendBck + ".provider"
+
+	// 5.0 add namespace
+	PropBackendBckNsUUID = PropBackendBck + ".namespace.uuid"
+	PropBackendBckNsName = PropBackendBck + ".namespace.name"
 )
 
 type (
@@ -217,9 +221,11 @@ type (
 		WritePolicy *WritePolicyConfToSet `json:"write_policy,omitempty"` // +gen:optional
 		// Provider-specific extras (S3, GCS, Azure, OCI, HTTP).
 		Extra *ExtraToSet `json:"extra,omitempty"` // +gen:optional
-		// Skip safety validations that would otherwise reject the
-		// update (e.g., changing EC settings while a bucket is
-		// non-empty).
+
+		// Skip safety validations that would otherwise reject the update.
+		// Currently, the flag is used exclusively for EC, for the following two distinct use cases:
+		// - change ec.objsize_limit while EC remains enabled;
+		// - accept not-enough-targets warning when enabling EC (ie., when D + P + 1 > num-targets).
 		Force bool `json:"force,omitempty" copy:"skip" list:"omit"` // +gen:optional
 	}
 
@@ -232,6 +238,10 @@ type (
 		// Remote provider: one of `"aws"`, `"gcp"`, `"azure"`,
 		// `"oci"`, `"ht"`.
 		Provider *string `json:"provider"` // +gen:optional
+
+		// Remote bucket namespace. When specified, replaces the complete
+		// namespace; nil leaves the existing namespace unchanged.
+		Ns *Ns `json:"namespace,omitempty"` // +gen:optional
 	}
 )
 
@@ -247,11 +257,18 @@ type (
 // * Inherited defaults include checksum, LRU, etc. configurations - see below.
 // * By default, LRU is disabled for AIS (`ais://`) buckets.
 //
+// TODO: pointerize/sparsify BMD, similar to cluster config. Note, however:
+// DefaultProps is a one-time snapshot - once in BMD, each section belongs to
+// the bucket, and later cluster-config or code-default changes must not alter
+// its meaning.
+//
 // See also:
 //   - github.com/NVIDIA/aistore/blob/main/docs/bucket.md#bucket-properties
 //   - BpropsToSet (above)
 //   - bckPropsArgs.inheritMerge()
 func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
+	debug.Assert(c.Mirror != nil && c.EC != nil && c.Chunks != nil)
+
 	lru := c.LRU
 	if bck.IsAIS() {
 		lru.Enabled = false
@@ -272,11 +289,11 @@ func (bck *Bck) DefaultProps(c *ClusterConfig) *Bprops {
 	return &Bprops{
 		Cksum:       cksum,
 		LRU:         lru,
-		Mirror:      c.Mirror,
+		Mirror:      *c.Mirror,
 		Versioning:  c.Versioning,
 		Access:      apc.AccessAll,
-		EC:          c.EC,
-		Chunks:      c.Chunks,
+		EC:          *c.EC,
+		Chunks:      *c.Chunks,
 		WritePolicy: wp,
 		RateLimit:   c.RateLimit,
 		Features:    c.Features,
@@ -333,7 +350,9 @@ func (bp *Bprops) Validate(targetCnt int) error {
 			err = pv.ValidateAsProps()
 		}
 		if err != nil {
-			if !IsErrWarning(err) {
+			// defer insufficient-target validation error;
+			// the caller may override it with --force
+			if !IsErrNotEnoughTargets(err) {
 				return err
 			}
 			softErr = err
@@ -361,6 +380,10 @@ func (bp *Bprops) Validate(targetCnt int) error {
 func (bp *Bprops) Apply(propsToSet *BpropsToSet) {
 	err := CopyProps(propsToSet, bp, apc.Daemon)
 	debug.AssertNoErr(err)
+
+	if propsToSet.BackendBck != nil {
+		bp.BackendBck.Props = nil
+	}
 }
 
 //
@@ -398,6 +421,8 @@ const (
 	maxCustomLen = 128
 )
 
+// TODO: remove in 5.1
+// [backward compatibility] ExtraPropsHDFS removed in v4.3
 func (c *ExtraProps) UnmarshalJSON(data []byte) error {
 	type Alias ExtraProps // not to recurs
 	var tmp Alias
@@ -407,7 +432,6 @@ func (c *ExtraProps) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	// [backward compatibility] ExtraPropsHDFS removed in v4.3
 	type withHDFS struct {
 		Alias
 		HDFS jsoniter.RawMessage `json:"hdfs,omitempty"`

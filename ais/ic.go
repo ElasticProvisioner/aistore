@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -142,7 +141,7 @@ outer:
 		r.ContentLength = int64(len(body))
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
-	ic.p.reverseNodeRequest(w, r, psi)
+	ic.p.reverseNodeRequest(w, r, smap, psi)
 	return true
 }
 
@@ -159,8 +158,7 @@ func (ic *ic) redirectToIC(w http.ResponseWriter, r *http.Request) bool {
 			break
 		}
 	}
-	now := time.Now().UnixNano()
-	redurl := ic.p.redurl(r, node, smap.Version, now, cmn.NetIntraControl, "")
+	redurl := ic.p.redurl(r, node, smap.Version, cmn.NetIntraControl, "")
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 	return true
 }
@@ -427,7 +425,7 @@ func (ic *ic) syncICBundle() error {
 		}
 	}
 
-	if si.Eq(ic.p.si) {
+	if si.EqNetID(ic.p.si) {
 		return nil
 	}
 	cargs := allocCargs()

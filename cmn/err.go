@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn/cos"
@@ -76,8 +77,9 @@ type (
 	ErrRemoteBucketOffline struct{ bck Bck }
 	ErrBckNotFound         struct{ bck Bck }
 	ErrRemoteBckNotFound   struct {
-		bck Bck
-		ctx string
+		bck          Bck
+		detail       string
+		cannotCreate bool
 	}
 
 	ErrBckNameConflict struct {
@@ -211,10 +213,6 @@ type (
 		SvcName          string
 		k8s.PodStatus
 	}
-	ErrWarning struct {
-		what string
-	}
-
 	ErrLmetaCorrupted struct {
 		err error
 	}
@@ -263,14 +261,23 @@ type (
 		tag      string
 		from, to string
 	}
+
+	ErrBackendRetry struct {
+		err     error
+		retries int
+		total   time.Duration
+	}
+
+	ErrNotEnoughTargets struct {
+		detail string
+	}
 )
 
 var (
-	ErrSkip             = errors.New("skip")
-	ErrStartupTimeout   = errors.New("startup timeout") // related StartupMayTimeout
-	ErrQuiesceTimeout   = errors.New("timed out waiting for quiescence")
-	ErrNotEnoughTargets = errors.New("not enough target nodes")
-	ErrNoMountpaths     = errors.New("no mountpaths")
+	ErrSkip           = errors.New("skip")
+	ErrStartupTimeout = errors.New("startup timeout") // related StartupMayTimeout
+	ErrQuiesceTimeout = errors.New("timed out waiting for quiescence")
+	ErrNoMountpaths   = errors.New("no mountpaths")
 
 	// aborts
 	ErrXactRenewAbort   = errors.New("renewal abort")
@@ -390,8 +397,15 @@ func IsErrBucketAlreadyExists(err error) bool {
 
 // bucket--not--found -------------------------------
 
-func NewErrRemBckNotFound(bck *Bck) *ErrRemoteBckNotFound { return &ErrRemoteBckNotFound{bck: *bck} }
-func NewErrAisBckNotFound(bck *Bck) *ErrBckNotFound       { return &ErrBckNotFound{bck: *bck} }
+func NewErrRemBckNotFound(bck *Bck, detail ...string) *ErrRemoteBckNotFound {
+	e := &ErrRemoteBckNotFound{bck: *bck}
+	if len(detail) > 0 {
+		e.detail = detail[0]
+	}
+	return e
+}
+
+func NewErrAisBckNotFound(bck *Bck) *ErrBckNotFound { return &ErrBckNotFound{bck: *bck} }
 
 // [for convenience]
 func NewErrBckNotFound(bck *Bck) error {
@@ -401,16 +415,23 @@ func NewErrBckNotFound(bck *Bck) error {
 	return NewErrAisBckNotFound(bck)
 }
 
-func (e *ErrRemoteBckNotFound) CannotCreate() {
-	e.ctx = " (further details at " + GitHubHome + "/blob/main/docs/bucket.md#bucket-lifecycle)"
-}
+func (e *ErrRemoteBckNotFound) CannotCreate() { e.cannotCreate = true }
 
 func (e *ErrRemoteBckNotFound) Error() string {
+	var s string
 	if e.bck.IsCloud() {
 		np := apc.NormalizeProvider(e.bck.Provider)
-		return fmt.Sprintf("%s bucket %q does not exist%s", np, e.bck.Cname(""), e.ctx)
+		s = fmt.Sprintf("%s bucket %q does not exist", np, e.bck.Cname(""))
+	} else {
+		s = fmt.Sprintf("remote bucket %q does not exist", e.bck.String())
 	}
-	return fmt.Sprintf("remote bucket %q does not exist%s", e.bck.String(), e.ctx)
+	if e.detail != "" {
+		s += " (" + e.detail + ")"
+	}
+	if e.cannotCreate {
+		s += " (further details at " + GitHubHome + "/blob/main/docs/bucket.md#bucket-lifecycle)"
+	}
+	return s
 }
 
 func IsErrRemoteBckNotFound(err error) bool {
@@ -910,22 +931,6 @@ func (e *ErrETL) WithContext(ctx *ETLErrCtx) *ErrETL {
 		withPodStatus(ctx.PodStatus)
 }
 
-// ErrWarning
-// non-critical errors that can be ignored e.g, when `--force`-ed
-
-func NewErrWarning(what string) *ErrWarning {
-	return &ErrWarning{what}
-}
-
-func (e *ErrWarning) Error() string {
-	return e.what
-}
-
-func IsErrWarning(err error) bool {
-	var wrapped *ErrWarning
-	return errors.As(err, &wrapped)
-}
-
 // ErrLmetaCorrupted & ErrLmetaNotFound
 
 func NewErrLmetaCorrupted(err error) *ErrLmetaCorrupted {
@@ -1032,7 +1037,7 @@ func IsErrXactNonIC(err error) bool {
 // ErrTooManyRequests (429, 503)
 
 func NewErrTooManyRequests(err error, status int) *ErrTooManyRequests {
-	debug.Assert(!cos.IsTypedNil(err))
+	debug.Assert(err != nil && !cos.IsTypedNil(err)) // Error() derefs it; IsTypedNil alone lets untyped nil through
 	return &ErrTooManyRequests{err, status}
 }
 
@@ -1090,8 +1095,40 @@ func IsErrMembershipChange(err error) bool {
 	return errors.As(err, &wrapped)
 }
 
+// ErrBackendRetry
+
+func NewErrBackendRetry(err error, retries int, total time.Duration) *ErrBackendRetry {
+	return &ErrBackendRetry{err: err, retries: retries, total: total}
+}
+
+func (e *ErrBackendRetry) Error() string {
+	return fmt.Sprintf("backend rate limiter: request still throttled after %d retry attempt%s and %v total backoff: %v",
+		e.retries, cos.Plural(e.retries), e.total, e.err)
+}
+
+func (e *ErrBackendRetry) Unwrap() error { return e.err }
+
+// ErrNotEnoughTargets
+
+func NewErrNotEnoughTargets(detail string) *ErrNotEnoughTargets {
+	return &ErrNotEnoughTargets{detail}
+}
+
+func (e *ErrNotEnoughTargets) Error() string {
+	const msg = "not enough target nodes"
+	if e.detail == "" {
+		return msg
+	}
+	return msg + ": " + e.detail
+}
+
+func IsErrNotEnoughTargets(err error) bool {
+	var e *ErrNotEnoughTargets
+	return errors.As(err, &e)
+}
+
 //
-// more is-error helpers
+// more is-error helpers --------------------------------------
 //
 
 // nought: not a thing

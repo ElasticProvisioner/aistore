@@ -9,7 +9,7 @@ In the `ais etl` namespace, the commands include:
 ```console
 $ ais etl <TAB-TAB>
 
-init     show      view-logs   start     stop      rm      object    bucket
+init     show      view-logs   start     stop      rm      object    bucket    inspect
 ```
 
 For background on AIS-ETL, getting started, working examples, and tutorials, please refer to:
@@ -25,7 +25,7 @@ For background on AIS-ETL, getting started, working examples, and tutorials, ple
 ### Initializing an ETL
 
 * [Using a Runtime ETL Specification (Recommended)](#1-using-a-runtime-etl-specification-recommended)
-* [Using a Full Kubernetes Pod Spec (Advanced)](#2-using-a-full-kubernetes-pod-spec-advanced)
+* [Using a Full Kubernetes Pod Spec (Deprecated)](#2-using-a-full-kubernetes-pod-spec-deprecated)
 
 ### ETL Management
 
@@ -44,6 +44,7 @@ For background on AIS-ETL, getting started, working examples, and tutorials, ple
 
 * [Inline Transformation](#inline-transformation)
 * [Offline Transformation](#offline-transformation)
+* [Object Inspection](#object-inspection)
 
 ---
 
@@ -61,6 +62,7 @@ USAGE:
 
 COMMANDS:
    init  Initialize ETL using a runtime spec or full Kubernetes Pod spec YAML file (local or remote).
+   DEPRECATED: Kubernetes Pod spec initialization will be removed in v5.1; use an ETL runtime spec instead.
    Examples:
      - 'ais etl init -f my-etl.yaml'                      deploy ETL from a local YAML file;
      - 'ais etl init -f https://example.com/etl.yaml'     deploy ETL from a remote YAML file;
@@ -131,6 +133,11 @@ Additional Info:
      - 'ais etl bucket my-etl ais://src ais://dst --dry-run'                             preview transformation without executing;
      - 'ais etl bucket my-etl ais://src ais://dst --num-workers 8'                       use 8 concurrent workers for transformation;
      - 'ais etl bucket my-etl ais://src ais://dst --prepend processed/'                  add prefix to transformed object names.
+   inspect  Inspect each object with the specified ETL transformation for validation or other custom checks.
+   Examples:
+     - 'ais etl inspect my-etl ais://src'                    inspect all objects in a bucket;
+     - 'ais etl inspect my-etl ais://src --prefix images/'   inspect objects with prefix 'images/';
+     - 'ais etl inspect my-etl ais://src --list obj-1,obj-2' inspect listed objects.
 
 OPTIONS:
    --help, -h  Show help
@@ -198,9 +205,11 @@ $ ais etl init -f <URL> \
 
 ---
 
-### 2. **Using a Full Kubernetes Pod Spec (Advanced)**
+### 2. **Using a Full Kubernetes Pod Spec (Deprecated)**
 
-Use this option if you need full control over the ETL container’s deployment—such as advanced init containers, health checks, or if you're not using the AIS ETL framework.
+> **DEPRECATED:** Full Kubernetes Pod spec initialization will be removed in AIStore v5.1. Migrate to the [runtime ETL specification](#1-using-a-runtime-etl-specification-recommended).
+
+This option remains available only for backward compatibility.
 
 #### Example Pod Spec
 
@@ -537,7 +546,7 @@ USAGE:
    ais etl bucket ETL_NAME SRC_BUCKET[/OBJECT_NAME_or_TEMPLATE] DST_BUCKET [command options]
 
 OPTIONS:
-   all          Transform all objects from a remote bucket including those that are not present (not cached) in cluster
+   all          Include all objects from a remote bucket including those that are not present (not cached) in cluster
    cont-on-err  Keep running archiving xaction (job) in presence of errors in any given multi-object transaction
    dry-run      Show total size of new objects without really creating them
    ext          Mapping from old to new extensions of transformed objects' names
@@ -621,3 +630,19 @@ ais etl bucket transformer-md5 ais://src_bucket ais://dst_bucket --dry-run --wai
 ```
 
 > Learn more: [Offline ETL Transformation](https://github.com/NVIDIA/aistore/blob/main/docs/etl.md#offline-etl-transformation)
+
+---
+
+## Object Inspection
+
+Use `ais etl inspect` to inspect each object with the specified ETL transformation. Common uses include validation, policy checks, and other custom checks. The command does not create transformed output objects.
+
+```bash
+ais etl inspect <ETL_NAME> <SRC_BUCKET> [--prefix PREFIX | --list OBJECTS | --template TEMPLATE]
+```
+
+For remote buckets, `--all` also includes objects that are not present in the cluster. To view failed objects after the job starts, run:
+
+```bash
+ais etl show errors <ETL_NAME> <JOB_ID>
+```

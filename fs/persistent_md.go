@@ -1,6 +1,6 @@
 // Package fs provides mountpath and FQN abstractions and methods to resolve/map stored content
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package fs
 
@@ -27,6 +27,7 @@ var mdFilesDirs = [...]string{
 	fname.Bmd,
 	fname.BmdPrevious,
 	fname.Vmd,
+	fname.Smap,
 }
 
 func MarkerExists(marker string) bool {
@@ -118,6 +119,18 @@ func RemoveMarker(marker string, stup cos.StatsUpdater, stopping bool) (ok bool)
 			}
 		}
 	}
+
+	if !ok {
+		switch marker {
+		case fname.RebalanceMarker:
+			stup.SetClrFlag(cos.NodeAlerts, cos.RebalanceInterrupted, cos.Rebalancing)
+		case fname.ResilverMarker:
+			stup.SetClrFlag(cos.NodeAlerts, cos.ResilverInterrupted, cos.Resilvering)
+		}
+
+		return ok
+	}
+
 	switch marker {
 	case fname.RebalanceMarker:
 		stup.ClrFlag(cos.NodeAlerts, cos.RebalanceInterrupted|cos.Rebalancing)

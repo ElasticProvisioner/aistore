@@ -23,6 +23,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
+	"github.com/NVIDIA/aistore/memsys"
 	"github.com/NVIDIA/aistore/stats"
 
 	jsoniter "github.com/json-iterator/go"
@@ -62,6 +63,7 @@ func (p *proxy) s3Handler(w http.ResponseWriter, r *http.Request) {
 		p.headObjS3(w, r, apiItems)
 	case http.MethodGet:
 		if len(apiItems) == 0 {
+			// Keep in sync with t.s3Handler; update its root-path handling if ListBuckets is delegated.
 			// list all buckets; NOTE: compare with `p.easyURLHandler` and see
 			// "list buckets for a given provider" comment there
 			// perms: apc.AceListBuckets
@@ -256,9 +258,8 @@ func (p *proxy) handleMptUpload(w http.ResponseWriter, r *http.Request, items []
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 		return
 	}
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, tsi, redurl, bck.Name)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, smap, redurl, bck.Name)
 }
 
 // DELETE /s3/<bucket-name>?delete
@@ -304,9 +305,8 @@ func (p *proxy) delMultipleObjs(w http.ResponseWriter, r *http.Request, bucket s
 	var (
 		msg2  apc.ActMsg
 		bt    = cos.MustMarshal(&msg)
-		query = make(url.Values, 1)
+		query = bck.AddToQuery(nil)
 	)
-	query.Set(apc.QparamProvider, apc.AIS)
 	if err := jsoniter.Unmarshal(bt, &msg2); err != nil {
 		err = fmt.Errorf(cmn.FmtErrUnmarshal, p, "list-range action message", cos.BHead(bt), err)
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err})
@@ -541,9 +541,9 @@ func (p *proxy) copyObjS3(w http.ResponseWriter, r *http.Request, items []string
 	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln("COPY:", r.Method, bckSrc.Cname(objName), "=>", bckDst.Cname(""), items, tsi.StringEx())
 	}
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
-	p.s3Redirect(w, r, tsi, redurl, bckDst.Name)
+	// signed redirect (target /s3 on pub and intra-data)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, "")
+	p.s3Redirect(w, r, tsi, smap, redurl, bckDst.Name)
 }
 
 // PUT /s3/<bucket-name>/<object-name> - with empty `cos.S3HdrObjSrc`
@@ -576,9 +576,9 @@ func (p *proxy) directPutObjS3(w http.ResponseWriter, r *http.Request, items []s
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, tsi, redurl, bck.Name)
+	// signed redirect (and NOTE: target /s3 listens on pub and intra-data)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, smap, redurl, bck.Name)
 }
 
 // +gen:endpoint GET /s3/{bucket-name}/{object-name}
@@ -615,30 +615,35 @@ func (p *proxy) getObjS3(w http.ResponseWriter, r *http.Request, items []string,
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
-	p.s3Redirect(w, r, tsi, redurl, bck.Name)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, smap, redurl, bck.Name)
 }
 
 // GET /s3/<bucket-name>/<object-name> with `s3.QparamMptUploads`
 func (p *proxy) listMultipart(w http.ResponseWriter, r *http.Request, bck *meta.Bck, q url.Values) {
 	smap := p.owner.smap.get()
+
+	// NOTE:
+	// Target-side /s3 is served on the public and intra-data networks - not intra-control.
+	// Although ListMultipartUploads is metadata-only, both the single-target redirect and
+	// the internal fanout below must use intra-data when addressing a target's /s3 endpoint.
 	if smap.CountActiveTs() == 1 {
 		si, err := smap.HrwName2T(bck.MakeUname(""))
 		if err != nil {
 			s3.WriteErr(w, r, s3.ErrInfo{Err: err})
 			return
 		}
-		started := time.Now()
-		redurl := p.redurl(r, si, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
-		p.s3Redirect(w, r, si, redurl, bck.Name)
+		redurl := p.redurl(r, si, smap.Version, cmn.NetIntraData, "")
+		p.s3Redirect(w, r, si, smap, redurl, bck.Name)
 		return
 	}
+
 	// bcast & aggregate
+
 	all := &s3.ListMptUploadsResult{}
 	for _, si := range smap.Tmap {
 		var (
-			url   = si.URL(cmn.NetPublic)
+			url   = si.URL(cmn.NetIntraData) // see Note above
 			cargs = allocCargs()
 		)
 		cargs.si = si
@@ -689,22 +694,29 @@ func (p *proxy) headObjS3(w http.ResponseWriter, r *http.Request, items []string
 	}
 
 	smap := p.owner.smap.get()
-	tsi, err := smap.HrwName2T(bck.MakeUname(objName))
+	tsi, netPub, err := smap.HrwMultiHome(bck.MakeUname(objName))
 	if err != nil {
 		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusInternalServerError})
 		return
 	}
+
 	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	// forward using data net (to reach target's /s3)
-	//
-	// TODO -- FIXME: eliminate reverse
-	// (make p.s3Redirect() work, otherwise - direct call)
-	parsedURL, err := url.Parse(tsi.URL(cmn.NetIntraData))
-	debug.AssertNoErr(err)
-	p.reverseRequest(w, r, tsi.ID(), parsedURL)
+	if cmn.Rom.Features().IsSet(feat.S3RedirectRebuild) {
+		// HEAD responses do not carry the XML <Endpoint> required by clients
+		// that reconstruct redirected requests.
+		// See also:
+		// - s3Redirect below
+		// - https://github.com/NVIDIA/aistore/blob/main/docs/s3compat.md#s3-clients-two-distinct-types
+		p.s3ReverseRequest(w, r, tsi, smap)
+		return
+	}
+
+	// signed redirect (and NOTE: target /s3 listens on pub and intra-data)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
+	p.s3Redirect(w, r, tsi, smap, redurl, bck.Name)
 }
 
 // +gen:endpoint DELETE /s3/{bucket-name}/{object-name}
@@ -737,9 +749,9 @@ func (p *proxy) delObjS3(w http.ResponseWriter, r *http.Request, items []string)
 	if cmn.Rom.V(5, cos.ModS3) {
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", tsi.StringEx())
 	}
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
-	p.s3Redirect(w, r, tsi, redurl, bck.Name)
+	// signed redirect (target /s3 on pub and intra-data)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, "")
+	p.s3Redirect(w, r, tsi, smap, redurl, bck.Name)
 }
 
 // +gen:endpoint GET /s3/{bucket-name} [s3.QparamVersioning=string]
@@ -778,6 +790,11 @@ func (p *proxy) putBckVersioningS3(w http.ResponseWriter, r *http.Request, bucke
 	if bck == nil {
 		return
 	}
+	if err := p.access(r, bck, apc.AcePATCH); err != nil {
+		s3.WriteErr(w, r, s3.ErrInfo{Err: err, Status: http.StatusForbidden})
+		return
+	}
+
 	decoder := xml.NewDecoder(r.Body)
 	vconf := &s3.VersioningConfiguration{}
 	if err := decoder.Decode(vconf); err != nil {
@@ -813,51 +830,91 @@ func (p *proxy) initByNameOnly(w http.ResponseWriter, r *http.Request, bucket st
 	return bck
 }
 
-// either reverse-proxy call _or_ HTTP-redirect to a designated node
-// see also: docs/s3compat.md
-func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, redurl, bucket string) {
+// [strict sign-verify] both redirect channels carry the signed URL:
+// - 307 Location: redurl signed via p.redurl (`svgrp` params);
+// - XML <Endpoint>: full redurl, XML-escaped (`&` => `&amp;`).
+// NOTE:
+//   - included python/aistore/botocore_patch follows the Location header verbatim (never parses <Endpoint>),
+//     so patched botocore/boto3 needs no change; the escaped <Endpoint> serves other XML-reading S3 clients.
+//   - the helper MAY execute reverse-proxy if configured
+func (p *proxy) s3Redirect(w http.ResponseWriter, r *http.Request, si *meta.Snode, smap *smapX, redurl, bucket string) {
+	// Deprecated: reverse-proxy S3 API call to a designated target
 	if cmn.Rom.Features().IsSet(feat.S3ReverseProxy) {
-		// [intra-cluster communications]
-		// instead of regular HTTP redirect (below) reverse-proxy S3 API call to a designated target
-		// forward using pub net
-		parsedURL, err := url.Parse(si.URL(cmn.NetPublic))
-		debug.AssertNoErr(err)
-		p.reverseRequest(w, r, si.ID(), parsedURL)
+		p.s3ReverseRequest(w, r, si, smap)
 		return
 	}
 
-	h := w.Header()
-	h.Set(cos.HdrLocation, redurl)
-	h.Set(cos.HdrContentType, "text/xml; charset=utf-8")
-	h.Set(cos.HdrServer, s3.AISServer)
+	// redirect
+	endpoint := redurl
+	if cmn.Rom.Features().IsSet(feat.S3RedirectRebuild) {
+		// making exception to support clients that reconstruct S3 endpoints
+		// see https://github.com/NVIDIA/aistore/blob/main/docs/s3compat.md#s3-clients-two-distinct-types
+		endpoint = extractEndpoint(redurl)
+	}
 
+	const xmlOverhead = 160 // XML literals below
 	var (
-		ep = extractEndpoint(redurl)
-		ll = max(256, 175+len(ep)+len(bucket)-27)
-		bb = bytes.NewBuffer(make([]byte, ll)) // TODO: consider using smm (small-size allocator) - here and elsewhere
+		ll        = max(256, xmlOverhead+len(endpoint)+strings.Count(endpoint, "&")*4+len(bucket))
+		size      = max(memsys.DefaultSmallBufSize /*1KB*/, ll)
+		buf, slab = p.smm.AllocSize(int64(size))
+		bb        = bytes.NewBuffer(buf[:0])
 	)
-	bb.Reset()
+
 	bb.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
 	bb.WriteString("<Error><Code>TemporaryRedirect</Code><Message>Redirect</Message>")
 	bb.WriteString("<Endpoint>")
-	bb.WriteString(ep)
+	xmlEscAmp(bb, endpoint)
 	bb.WriteString("</Endpoint>")
 	bb.WriteString("<Bucket>")
 	bb.WriteString(bucket)
 	bb.WriteString("</Bucket></Error>")
 
+	// for conforming HTTP clients:
+	hdr := w.Header()
+	hdr.Set(cos.HdrLocation, redurl)
+	hdr.Set(cos.HdrContentType, "text/xml; charset=utf-8")
+	hdr.Set(cos.HdrServer, s3.AISServer)
+
 	w.WriteHeader(http.StatusTemporaryRedirect)
 	w.Write(bb.Bytes())
+
+	slab.Free(buf)
 }
 
-// extractEndpoint extracts an S3 endpoint from the full URL path.
-// Endpoint is a host name with port and root URL path (if exists).
-// E.g. for AIS `http://localhost:8080/s3/bck1/obj1` the endpoint
-// would be `localhost:8080/s3`
-func extractEndpoint(path string) string {
-	ep := path
+// forward using intra-data net (object payloads; see also reverseNodeRequest);
+// stamp/sign via intra headers - svReq.payload() excludes query/host/scheme,
+// so the URL rewrite below cannot invalidate the signature
+func (p *proxy) s3ReverseRequest(w http.ResponseWriter, r *http.Request, si *meta.Snode, smap *smapX) {
+	parsedURL, err := url.Parse(si.URL(cmn.NetIntraData))
+	debug.AssertNoErr(err)
+
+	p.setIntraHdrs(r, smap, si != nil)
+	p.reverseRequest(w, r, si.ID(), parsedURL)
+}
+
+// escape `&` for XML content; signed redurl query separators
+func xmlEscAmp(bb *bytes.Buffer, s string) {
+	for {
+		i := strings.IndexByte(s, '&')
+		if i < 0 {
+			bb.WriteString(s)
+			return
+		}
+		bb.WriteString(s[:i])
+		bb.WriteString("&amp;")
+		s = s[i+1:]
+	}
+}
+
+// extractEndpoint returns the legacy XML <Endpoint> form used with
+// feat.S3RedirectRebuild, for clients that reconstruct redirected requests
+// instead of following Location verbatim.
+//
+// For http://host:port/s3/bck/obj?... it returns host:port/s3.
+func extractEndpoint(redurl string) string {
+	ep := redurl
 	if idx := strings.Index(ep, "/"+apc.S3); idx > 0 {
-		ep = ep[:idx+3]
+		ep = ep[:idx+len(apc.S3)+1]
 	}
 	ep = strings.TrimPrefix(ep, "http://")
 	ep = strings.TrimPrefix(ep, "https://")

@@ -1,6 +1,6 @@
 // Package s3_integration provides tests of compatibility with AWS S3
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package s3_test
 
@@ -31,6 +31,9 @@ func TestE2ES3(t *testing.T) {
 	}
 
 	tools.InitLocalCluster()
+
+	// check feat.S3ReverseProxy and maybe set feat.S3RedirectRebuild
+	tools.PrepForS3RebuildClientOrSkip(t)
 
 	RegisterFailHandler(Fail)
 	RunSpecs(t, t.Name())

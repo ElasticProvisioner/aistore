@@ -308,9 +308,8 @@ func (t *target) init(config *cmn.Config) {
 		// later on during startup sequence - and not finding _this_ target in it
 	}
 
-	t.htrun.nodeSigningKey, _ = initTargetSigningKey(tid, config) // TODO -- FIXME: similar recovery as above
-
-	t.si.Init(tid, apc.Target, t.htrun.nodeSigningKey.VerifyingKey)
+	keyPair := t.newKeyPair(tid, apc.Target)
+	t.si.Init(tid, apc.Target, keyPair.VerifyingKey)
 
 	debug.Assert(t.si.IDDigest != 0)
 	cos.InitShortID(t.si.IDDigest)
@@ -319,10 +318,9 @@ func (t *target) init(config *cmn.Config) {
 
 	// new fs, check and add mountpaths
 	vini := volume.IniCtx{
-		NodeSigningKey: t.htrun.nodeSigningKey,
-		UseLoopbacks:   daemon.cli.target.useLoopbackDevs,
-		IgnoreMissing:  daemon.cli.target.startWithLostMountpath,
-		RandomTID:      generated,
+		UseLoopbacks:  daemon.cli.target.useLoopbackDevs,
+		IgnoreMissing: daemon.cli.target.startWithLostMountpath,
+		RandomTID:     generated,
 	}
 	newVol := volume.Init(t, config, vini)
 	if err := fs.SetVolSizeMedia(); err != nil {
@@ -343,8 +341,8 @@ func (t *target) init(config *cmn.Config) {
 
 	t.fsprg.init(t, newVol) // subgroup of the daemon.rg rungroup
 
-	sc := transport.Init(ts, g.netServ.data.useIPv6) // init transport sub-system
-	daemon.rg.add(sc)                                // new stream collector
+	sc := transport.Init(ts, t.streamSign, t.streamVerify, g.netServ.data.useIPv6) // init transport sub-system
+	daemon.rg.add(sc)                                                              // new stream collector
 
 	t.fshc = health.NewFSHC(t)
 
@@ -374,12 +372,11 @@ func (t *target) initHostIP(config *cmn.Config) {
 
 	nlog.Infoln("AIS_HOST_IP:", hostIP, "pub:", t.si.URL(cmn.NetPublic))
 
-	// applies to intra-cluster networks unless separately defined
-	if !config.HostNet.UseIntraControl {
-		t.si.ControlNet = t.si.PubNet
-	}
+	debug.Assert(config.HostNet.UseIntraControl, "see LocalConfig.Validate()")
 	if !config.HostNet.UseIntraData {
-		t.si.DataNet = t.si.PubNet
+		// when intra-data is not separately configured, intra-data traffic uses
+		// the intra-control endpoint
+		t.si.DataNet = t.si.ControlNet
 	}
 }
 
@@ -409,33 +406,6 @@ func initTID(config *cmn.Config) (tid string, generated bool) {
 	return tid, generated
 }
 
-func initTargetSigningKey(tid string, config *cmn.Config) (pair *cos.NodeSigningKey, generated bool) {
-	err := cos.ValidateDaemonID(tid)
-	cos.AssertNoErr(err) // FATAL
-
-	pair, err = fs.LoadNodeSigningKey(config.FSP.Paths, tid)
-	switch {
-	case err != nil:
-		cos.ExitLog(err) // FATAL
-	case pair != nil:
-		fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
-		debug.AssertNoErr(err)
-		nlog.Infof("loaded node signing key for %s, verifying-key fp %s", meta.Tname(tid), fp)
-	default:
-		pub, priv, err := cos.GenerateNodeSigningKey()
-		if err != nil {
-			cos.ExitLog(fmt.Errorf("failed to generate node signing key for %s: %w", meta.Tname(tid), err))
-		}
-		pair = cos.NewNodeSigningKey(priv, pub)
-
-		fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
-		debug.AssertNoErr(err)
-		nlog.Infof("generated node signing key for %s, verifying-key fp %s", meta.Tname(tid), fp)
-		generated = true
-	}
-	return pair, generated
-}
-
 func regDiskMetrics(node *meta.Snode, tstats *stats.Trunner, mpi fs.MPI) {
 	for _, mi := range mpi {
 		for _, disk := range mi.Disks {
@@ -454,7 +424,11 @@ func (t *target) Run() error {
 
 	core.Tinit(t, config, true /*run hk*/)
 
-	fatalErr, writeErr := t.checkRestarted(config)
+	// NOTE 5.1+ invariant:
+	// When `auth.intra_cluster.enabled`, restarted node must _not_ originate signed traffic to a peer
+	// until that peer has received an (updated version of) Smap containing the node's (current)
+	// verifying key.
+	fatalErr, writeErr := t.checkStartupMarkers(config)
 	if fatalErr != nil {
 		cos.ExitLog(fatalErr)
 	}
@@ -531,7 +505,7 @@ func (t *target) Run() error {
 	// register storage target's handler(s) and start listening
 	t.initRecvHandlers()
 
-	ec.Init()
+	ec.Init(t.setIntraHdrs)
 	mirror.Init()
 
 	xreg.RegWithHK()
@@ -651,17 +625,29 @@ func (t *target) initRecvHandlers() {
 	networkHandlers = append(networkHandlers,
 		networkHandler{r: apc.Buckets, h: t.bucketHandler, net: accessNetAll},
 		networkHandler{r: apc.Objects, h: t.objectHandler, net: accessNetAll},
-		networkHandler{r: apc.Daemon, h: t.daemonHandler, net: accessNetPublicControl},
+
+		// (pub + control): apc.Daemon
+		networkHandler{r: apc.Daemon, h: t.daePubHandler, net: accessNetPublic},
+		networkHandler{r: apc.Daemon, h: t.daemonHandler, net: accessNetIntraControl},
+
 		networkHandler{r: apc.Metasync, h: t.metasyncHandler, net: accessNetIntraControl},
-		networkHandler{r: apc.Health, h: t.healthHandler, net: accessNetPublicControl},
+
+		networkHandler{r: apc.Health, h: t.healthHandler, net: accessNetPublic},
+		networkHandler{r: apc.Health, h: t.healthCtrlHandler, net: accessNetIntraControl},
+
 		networkHandler{r: apc.Xactions, h: t.xactHandler, net: accessNetIntraControl},
 		networkHandler{r: apc.EC, h: t.ecHandler, net: accessNetIntraControl},
 		networkHandler{r: apc.Vote, h: t.voteHandler, net: accessNetIntraControl},
 		networkHandler{r: apc.Txn, h: t.txnHandler, net: accessNetIntraControl},
+
+		// (control + data): transport performs its own per-stream authentication
+		// based on (trname, session-ID)
 		networkHandler{r: apc.ObjStream, h: transport.RxAnyStream, net: accessControlData},
 
 		networkHandler{r: apc.Download, h: t.downloadHandler, net: accessNetIntraControl},
-		networkHandler{r: apc.ETL, h: t.etlHandler, net: accessNetAll},
+
+		networkHandler{r: apc.ETL, h: t.etlHandler, net: accessNetIntraControl},                // control-plane; management
+		networkHandler{r: apc.URLPathETLObject.S, h: t.etlObjHandler, net: accessNetIntraData}, // _object datapath
 
 		// machine learning
 		networkHandler{r: apc.ML, h: t.mlHandler, net: accessNetPublicControl},
@@ -675,7 +661,7 @@ func (t *target) initRecvHandlers() {
 	t.regNetHandlers(networkHandlers)
 }
 
-func (t *target) checkRestarted(config *cmn.Config) (fatalErr, writeErr error) {
+func (t *target) checkStartupMarkers(config *cmn.Config) (fatalErr, writeErr error) {
 	if fs.MarkerExists(fname.NodeRestartedMarker) {
 		red := redial{t: t, dialTout: config.Timeout.CplaneOperation.D(), totalTout: config.Timeout.MaxKeepalive.D()}
 		if red.acked() {
@@ -684,6 +670,12 @@ func (t *target) checkRestarted(config *cmn.Config) (fatalErr, writeErr error) {
 		}
 		t.statsT.SetFlag(cos.NodeAlerts, cos.NodeRestarted)
 		fs.PersistMarker(fname.NodeRestartedPrev, false /*quiet*/)
+	}
+	if fs.MarkerExists(fname.RebalanceMarker) {
+		t.statsT.SetFlag(cos.NodeAlerts, cos.RebalanceInterrupted)
+	}
+	if fs.MarkerExists(fname.ResilverMarker) {
+		t.statsT.SetFlag(cos.NodeAlerts, cos.ResilverInterrupted)
 	}
 	fatalErr, writeErr = fs.PersistMarker(fname.NodeRestartedMarker, false /*quiet*/)
 	return
@@ -767,15 +759,15 @@ func (t *target) bucketHandler(w http.ResponseWriter, r *http.Request) {
 		t.httpbckget(w, r, dpq)
 		dpqFree(dpq)
 	case http.MethodDelete:
-		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, false)
+		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, true)
 		t.httpbckdelete(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodPost:
-		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, false)
+		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, true)
 		t.httpbckpost(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodHead:
-		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, false)
+		apireq := apiReqAlloc(1, apc.URLPathBuckets.L, true)
 		t.httpbckhead(w, r, apireq)
 		apiReqFree(apireq)
 	default:
@@ -787,7 +779,7 @@ func (t *target) bucketHandler(w http.ResponseWriter, r *http.Request) {
 func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true /*dpq*/)
+		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true /*dpq*/) // dpq true here and elsewhere - further used in verifyObjVerb()
 		t.httpobjget(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodHead:
@@ -808,7 +800,7 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		apiReqFree(apireq)
 	case http.MethodDelete:
-		apireq := apiReqAlloc(2, apc.URLPathObjects.L, false)
+		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true)
 		t.httpobjdelete(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodPost:
@@ -816,13 +808,116 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 		t.httpobjpost(w, r, apireq)
 		apiReqFree(apireq)
 	case http.MethodPatch:
-		apireq := apiReqAlloc(2, apc.URLPathObjects.L, false)
+		apireq := apiReqAlloc(2, apc.URLPathObjects.L, true)
 		t.httpobjpatch(w, r, apireq)
 		apiReqFree(apireq)
 	default:
 		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodHead,
 			http.MethodPost, http.MethodPut)
 	}
+}
+
+// verify signature if auth.intra_control enabled
+// applies to object-level (httpobj*) verbs
+func (t *target) verifyObjVerb(w http.ResponseWriter, r *http.Request, dpq *dpq) bool /*ok*/ {
+	ecode, err := t.checkObjVerb(r, dpq)
+	if err == nil {
+		return true
+	}
+	t.writeErr(w, r, err, ecode)
+	return false
+}
+
+func (t *target) checkObjVerb(r *http.Request, dpq *dpq) (ecode int, err error) {
+	debug.Assert(dpq != nil)
+
+	// arrived via one of the 3 nets
+	net := _reqNet(r)
+
+	// 1. unsigned
+	if cmn.IsV50Bridge() || !cmn.Rom.SignVerifyEnabled() {
+		return t._verifyUnsigned(r, dpq, net)
+	}
+
+	// 2. redirect may arrive on all 3 nets - see p.redurl() (decides the appropriate destination network)
+	if hasRedirectMarker(dpq) {
+		return t._verifySigned(r, dpq)
+	}
+
+	// 3. signed T2T
+	debug.Assert(net == reqNetCtrl || net == reqNetData)
+	debug.Assert(!hasRedirectMarker(dpq))
+
+	return t.checkIntra(r, false /*only primary*/, net)
+}
+
+func (t *target) _verifyUnsigned(r *http.Request, dpq *dpq, net reqNet) (ecode int, err error) {
+	// ditto - redirect may arrive on all 3 nets (comment above)
+	if hasRedirectMarker(dpq) {
+		return 0, nil
+	}
+
+	if net == reqNetPub {
+		config := cmn.GCO.Get()
+
+		// Starting with v5.0, direct target access is rejected when either AuthN
+		// or intra-cluster request signing is configured: both require proxy mediation.
+		if config.Auth.RequiresProxyMediation() {
+			return http.StatusForbidden, errDirectTargetAccess
+		}
+
+		// Some S3 clients rebuild redirected requests from XML <Endpoint>,
+		// dropping AIS redirect query parameters. At the target, the resulting
+		// request is indistinguishable from direct public S3 access.
+		if dpq.isS3 && config.Features.IsSet(feat.S3RedirectRebuild) {
+			return 0, nil
+		}
+
+		switch r.Method {
+		case http.MethodPut, http.MethodDelete, http.MethodPost, http.MethodPatch:
+			err = fmt.Errorf("%s: %s(obj) is expected to be redirected", t.si, r.Method)
+			return http.StatusBadRequest, err
+		}
+		return 0, nil // legacy direct read access (GET, HEAD)
+	}
+
+	// intra arrival; v5.0 bridge: 4.x senders don't stamp sender headers
+	if cmn.IsV50Bridge() {
+		return 0, nil
+	}
+
+	// ditto (see above)
+	if ecode, err = t.checkIntra(r, false /*only primary*/, net); err != nil {
+		err = fmt.Errorf(fmtErrInvIntraObj, t.si, r.Method, r.RemoteAddr, err)
+	}
+	return ecode, err
+}
+
+func (t *target) verifyRedirect(r *http.Request, dpq *dpq) (ecode int, err error) {
+	if !hasRedirectMarker(dpq) {
+		return http.StatusUnauthorized, errDirectTargetAccess
+	}
+	return t._verifySigned(r, dpq)
+}
+
+func (t *target) _verifySigned(r *http.Request, dpq *dpq) (ecode int, err error) {
+	var (
+		svgrp *svgrp
+		pid   = dpq.sys.pid
+		smap  = t.owner.smap.get()
+	)
+	// target's Smap is never nil; there _may_ be a very narrow startup window
+	// when it's invalid but then we just fail a signed request (unlikely)
+	debug.Assert(smap.isValid())
+
+	if dpq.sv.sig != "" {
+		svgrp = &dpq.sv
+	}
+	if svgrp != nil || t.svs.strict() {
+		sv := newVerifier(r, &t.htrun, svgrp)
+		return sv.verify(pid, smap.GetNode(pid), smap)
+	}
+	return 0, nil
 }
 
 //
@@ -838,30 +933,23 @@ func (t *target) objectHandler(w http.ResponseWriter, r *http.Request) {
 // If the bucket is in the Cloud one and ValidateWarmGet is enabled there is an extra
 // check whether the object exists locally. Version is checked as well if configured.
 func (t *target) httpobjget(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	err := t.parseReq(w, r, apireq)
-	if err != nil {
+	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	err = apireq.dpq.parse(r.URL.RawQuery)
-	if err != nil {
-		debug.AssertNoErr(err)
-		t.writeErr(w, r, err)
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
 		return
 	}
-	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if apireq.dpq.sys.ptime == "" /*isRedirect*/ && t.checkIntraCall(r, false /*from primary*/) != nil {
-			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
-				t.si, r.Method, r.RemoteAddr)
-			return
-		}
-	}
+
 	objName := apireq.items[1]
 	if err := cos.ValidateWname(objName); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
-	lom := core.AllocLOM(objName)
 
+	var (
+		lom = core.AllocLOM(objName)
+		err error
+	)
 	lom, err = t.getObject(w, r, apireq.dpq, apireq.bck, lom)
 	if err != nil {
 		t._erris(w, r, err, 0, apireq.dpq.silent)
@@ -880,28 +968,58 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 		}
 	}
 
+	var (
+		blobDownload = cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload))
+		thresholdStr = r.Header.Get(apc.HdrBlobThreshold)
+	)
+
 	// two special flows
 	switch {
 	case dpq.get(apc.QparamETLName) != "":
 		t.inlineETL(w, r, dpq, lom)
 		return lom, nil
-	case cos.IsParseBool(r.Header.Get(apc.HdrBlobDownload)):
+	case blobDownload || thresholdStr != "":
+		var threshold int64
+		if thresholdStr != "" {
+			var err error
+			if threshold, err = strconv.ParseInt(thresholdStr, 10, 64); err != nil {
+				return lom, fmt.Errorf("blob-downloader: failed to parse %s=%s: %w",
+					apc.HdrBlobThreshold, thresholdStr, err)
+			}
+			if threshold < 0 {
+				return lom, fmt.Errorf("blob-downloader: invalid %s=%s: expecting a non-negative value",
+					apc.HdrBlobThreshold, thresholdStr)
+			}
+		}
+		if !blobDownload && threshold == 0 {
+			break
+		}
+		if !bck.IsRemote() {
+			return lom, fmt.Errorf("blob-downloader is not supported for local buckets: %s", bck.Cname(""))
+		}
+
 		var msg apc.BlobMsg
 		if err := msg.FromHeader(r.Header); err != nil {
 			return lom, err
 		}
 
 		args := &core.BlobParams{
-			RespWriter: w, // NOTE: make a blocking call
-			Lom:        lom,
-			Msg:        &msg,
-			Parent:     "GET",
+			RespWriter:    w, // NOTE: make a blocking call
+			Lom:           lom,
+			Msg:           &msg,
+			BlobThreshold: threshold,
+			Parent:        "GET",
 		}
 		xid, _, err := t.blobdl(args, nil /*oa*/, w.Header())
 		if err != nil && xid != "" {
 			// (for the same reason as cmn.ErrGetTxBenign)
 			nlog.Warningln("GET", lom.Cname(), "via blob-download["+xid+"]:", err)
 			err = nil
+		}
+		if threshold > 0 && xid == "" && err == nil {
+			// Blob download was not started (for example, warm or below threshold).
+			// Fall through to regular GET.
+			break
 		}
 		return lom, err
 	}
@@ -1017,10 +1135,8 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 	var (
 		config  = cmn.GCO.Get()
 		started = time.Now().UnixNano()
-		t2tput  = isT2TPut(r.Header)
 	)
-	if apireq.dpq.sys.ptime == "" && !t2tput {
-		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected or replicated", t.si, r.Method)
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
 		return
 	}
 
@@ -1123,7 +1239,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 		vlabs := map[string]string{stats.VlabBucket: lom.Bck().Cname("")}
 		t.statsT.IncWith(stats.ErrAppendCount, vlabs)
 	default:
-		ecode, err = t.putObject(w, r, dpq, lom, t2tput, config)
+		ecode, err = t.putObject(w, r, dpq, lom, config)
 	}
 	if err != nil {
 		t.FSHC(err, lom.Mountpath(), "") // TODO: removed from the place where happened, fqn missing...
@@ -1132,7 +1248,7 @@ func (t *target) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiR
 }
 
 // NOTE: lom bucket needs to be initialized before calling this method
-func (t *target) putObject(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM, t2t bool, config *cmn.Config) (ecode int, err error) {
+func (t *target) putObject(w http.ResponseWriter, r *http.Request, dpq *dpq, lom *core.LOM, config *cmn.Config) (ecode int, err error) {
 	skipVC := lom.IsFeatureSet(feat.SkipVC) || dpq.skipVC
 	if !skipVC {
 		_ = lom.Load(false, false)
@@ -1151,7 +1267,7 @@ func (t *target) putObject(w http.ResponseWriter, r *http.Request, dpq *dpq, lom
 		poi.config = config
 		poi.skipVC = skipVC // feat.SkipVC || apc.QparamSkipVC
 		poi.restful = true
-		poi.t2t = t2t
+		poi.t2t = reqIsIntraData(r)
 	}
 	ecode, err = poi.do(w.Header(), r, dpq)
 	freePOI(poi)
@@ -1167,10 +1283,10 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	if isRedirect(apireq.query) == "" {
-		t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected", t.si, r.Method)
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
 		return
 	}
+
 	objName := apireq.items[1]
 	if err := cos.ValidateWname(objName); err != nil {
 		t.writeErr(w, r, err)
@@ -1183,7 +1299,8 @@ func (t *target) httpobjdelete(w http.ResponseWriter, r *http.Request, apireq *a
 			t.writeErr(w, r, err)
 			return
 		}
-		if ecode, err := t.ups.abort(r, lom, apireq.query.Get(apc.QparamMptUploadID)); err != nil {
+		uploadID := apireq.dpq.get(apc.QparamMptUploadID)
+		if ecode, err := t.ups.abort(r, lom, uploadID); err != nil {
 			t.writeErr(w, r, err, ecode)
 		}
 		return
@@ -1223,8 +1340,7 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 	if t.parseReq(w, r, apireq) != nil {
 		return
 	}
-	if apireq.dpq.isRedirect() == "" {
-		t.writeErrf(w, r, "%s: %s-%s(obj) is expected to be redirected", t.si, r.Method, msg.Action)
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
 		return
 	}
 
@@ -1356,34 +1472,24 @@ func (t *target) _checkLocked(w http.ResponseWriter, r *http.Request, bck *meta.
 // See also: target.objHeadV2()
 
 func (t *target) httpobjhead(w http.ResponseWriter, r *http.Request, apireq *apiRequest) {
-	var (
-		err   error
-		ecode int
-	)
-	if err = t.parseReq(w, r, apireq); err != nil {
+	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	err = apireq.dpq.parse(r.URL.RawQuery)
-	if err != nil {
-		debug.AssertNoErr(err)
-		t.writeErr(w, r, err)
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
 		return
 	}
-	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		// validates that the request is internal (by a node in the same cluster)
-		if apireq.dpq.isRedirect() == "" && t.checkIntraCall(r, false) != nil {
-			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
-				t.si, r.Method, r.RemoteAddr)
-			return
-		}
-	}
+
 	objName := apireq.items[1]
 	if err := cos.ValidateRname(objName); err != nil {
 		t.writeErr(w, r, err)
 		return
 	}
 
-	lom := core.AllocLOM(objName)
+	var (
+		err   error
+		ecode int
+		lom   = core.AllocLOM(objName)
+	)
 	switch {
 	case apireq.dpq.get(apc.QparamProps) != "":
 		ecode, err = t.objHeadV2(r, w.Header(), apireq.dpq, apireq.bck, lom)
@@ -1550,12 +1656,8 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 	if err := t.parseReq(w, r, apireq); err != nil {
 		return
 	}
-	if cmn.Rom.Features().IsSet(feat.EnforceIntraClusterAccess) {
-		if isRedirect(apireq.query) == "" && t.checkIntraCall(r, false) != nil {
-			t.writeErrf(w, r, "%s: %s(obj) is expected to be redirected (remaddr=%s)",
-				t.si, r.Method, r.RemoteAddr)
-			return
-		}
+	if !t.verifyObjVerb(w, r, apireq.dpq) {
+		return
 	}
 
 	msg, err := t.readActionMsg(w, r)
@@ -1580,6 +1682,10 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		t.writeErr(w, r, err)
 		return
 	}
+	if err := cmn.ValidateCustomMD(custom); err != nil {
+		t.writeErrf(w, r, "%s: %v", lom.Cname(), err)
+		return
+	}
 
 	lom.Lock(true)
 	if err := lom.Load(true /*cache it*/, true /*locked*/); err != nil {
@@ -1591,7 +1697,7 @@ func (t *target) httpobjpatch(w http.ResponseWriter, r *http.Request, apireq *ap
 		}
 		return
 	}
-	delOldSetNew := cos.IsParseBool(apireq.query.Get(apc.QparamNewCustom))
+	delOldSetNew := cos.IsParseBool(apireq.dpq.get(apc.QparamNewCustom))
 	if delOldSetNew {
 		lom.SetCustomMD(custom)
 	} else {
@@ -1813,6 +1919,12 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 // rename obj
 // TODO: (copy, delete) under a single wlock
 func (t *target) objMv(lom *core.LOM, msg *apc.ActMsg) error {
+	if err := cos.ValidateWname(lom.ObjName); err != nil {
+		return err
+	}
+	if err := cos.ValidateOname(msg.Name); err != nil {
+		return err
+	}
 	if lom.Bck().IsRemote() {
 		return fmt.Errorf("%s: cannot rename object %s from remote bucket", t.si, lom)
 	}
@@ -1861,6 +1973,9 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Hea
 	}
 
 	if oa != nil {
+		if params.BlobThreshold > 0 && oa.Size < params.BlobThreshold {
+			return "", nil, nil
+		}
 		// write HTTP headers before starting blob download
 		cmn.ToHeader(oa, whdr, oa.Size)
 		return t._blobdl(params, oa)
@@ -1898,6 +2013,10 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Hea
 		if err != nil {
 			return "", nil, err
 		}
+	}
+	if params.BlobThreshold > 0 && oa.Size < params.BlobThreshold {
+		// below threshold, not qualified for blob-download
+		return "", nil, nil
 	}
 	// write HTTP headers before starting blob download
 	cmn.ToHeader(oa, whdr, oa.Size)

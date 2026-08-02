@@ -49,6 +49,8 @@ type (
 		Lom *LOM
 		Msg *apc.BlobMsg
 
+		BlobThreshold int64 // minimum remote object size (bytes); zero disables threshold selection
+
 		// caller/spawner for observability
 		// (e.g.: prefetch[abcdef], GET, api-blobdl, and x-start)
 		Parent string
@@ -68,6 +70,14 @@ type (
 		Size     int64
 		Timeout  time.Duration
 	}
+)
+
+// Stamp an already-constructed intra-cluster request to a known intra-cluster peer with:
+// - sender identity and,
+// - when enabled, signature headers.
+// See related: IntraCtrlPost
+type (
+	SetIntraHdrs func(req *http.Request)
 )
 
 type (
@@ -126,5 +136,10 @@ type (
 		BMDVersionFixup(r *http.Request, bck ...cmn.Bck)
 
 		GetFromNeighbor(params *GfnParams) (*http.Response, error)
+
+		// Send a stamped/signed intra-control POST to the destination node.
+		// The default way for subsystems below `ais` to issue one-shot control-plane
+		// requests; see related: SetIntraHdrs (EC shared streams).
+		IntraCtrlPost(dst *meta.Snode, path string, body []byte) error
 	}
 )

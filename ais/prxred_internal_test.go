@@ -1,17 +1,15 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/NVIDIA/aistore/api/apc"
 	"github.com/NVIDIA/aistore/cmn"
@@ -44,11 +42,11 @@ func newTestProxy(t *testing.T, signVerifyEnabled bool) *proxy {
 
 	p := &proxy{}
 
-	pub, priv, err := cos.GenerateNodeSigningKey()
+	pub, priv, err := cos.GenerateNodeKeyPair()
 	if err != nil {
 		t.Fatalf("failed to generate keys: %v", err)
 	}
-	p.htrun.nodeSigningKey = cos.NewNodeSigningKey(priv, pub)
+	p.htrun.nodeKeyPair = cos.NewNodeKeyPair(priv, pub)
 
 	p.si = &meta.Snode{}
 	p.si.Init(testProxyID, apc.Proxy, pub)
@@ -60,8 +58,12 @@ func newTestProxy(t *testing.T, signVerifyEnabled bool) *proxy {
 	smap.Primary = p.si
 	smap.Version = 1
 
-	p.owner.smap = newSmapOwner(config)
+	p.owner.smap = newSmapOwner(config, false /*isTarget*/)
 	p.owner.smap.put(smap) // populate the atomic.Pointer so get() works
+
+	// mirror node startup order: svs.init -> keypair -> config-driven toggle
+	p.htrun.svs.init()
+	p.htrun.toggleSignVerify(signVerifyEnabled) // as the cmn.Rom.Set callback would
 
 	return p
 }
@@ -69,10 +71,17 @@ func newTestProxy(t *testing.T, signVerifyEnabled bool) *proxy {
 func newTestSnode(t *testing.T) *meta.Snode {
 	t.Helper()
 
+	pub, _, err := cos.GenerateNodeKeyPair()
+	if err != nil {
+		t.Fatalf("failed to generate dst keys: %v", err)
+	}
+
 	si := &meta.Snode{}
-	si.Init(testDstID, apc.Target, nil /*verifying key*/)
+	si.Init(testDstID, apc.Target, pub)
+
 	si.PubNet.URL = "http://dst:8080"
 	si.ControlNet.URL = "http://dst:8080"
+
 	return si
 }
 
@@ -108,7 +117,7 @@ func makeRedirect(t *testing.T, signVerifyEnabled bool, method, path, rawQuery s
 	dst := newTestSnode(t)
 	req := newReq(method, path, rawQuery)
 
-	out := p.redurl(req, dst, smapVer, time.Now().UnixNano(), cmn.NetIntraControl, "")
+	out := p.redurl(req, dst, smapVer, cmn.NetIntraControl, "")
 	return p, req, parseRedirect(t, out)
 }
 
@@ -269,29 +278,8 @@ func TestSignerVerifyRoundTrip(t *testing.T) {
 		t.Fatal("sign/verify must be enabled for verify test")
 	}
 
-	// reconstruct the verifier from the request's own signed query params
-	// (pid, smap-ver, nonce, sig) — so the only variable across cases is the URL itself
-	verify := func(u *url.URL) (int, error) {
-		r := &http.Request{
-			Method:        orig.Method,
-			URL:           u,
-			Host:          u.Host,
-			ContentLength: orig.ContentLength,
-		}
-		q := r.URL.Query()
-		svgrp, err := svgrpFromQ(q)
-		if err != nil {
-			return 0, fmt.Errorf("parse sign/verify params: %w", err)
-		}
-		if svgrp == nil {
-			return 0, errors.New("expected sign/verify params, got nil")
-		}
-		sign := &signer{r: r, h: &p.htrun, smapVer: svgrp.smapVer, nonce: svgrp.nonce}
-		return sign.verify(q.Get(apc.QparamPID), svgrp.sig)
-	}
-
 	// 1. valid signed URL verifies
-	if status, err := verify(u); err != nil || status != 0 {
+	if status, err := p.verify(u, orig); err != nil || status != 0 {
 		t.Fatalf("verify failed for valid signed URL: status=%d, err=%v, url=%q", status, err, u.String())
 	}
 
@@ -300,9 +288,30 @@ func TestSignerVerifyRoundTrip(t *testing.T) {
 	// differing input into svPayload
 	uBad := *u
 	uBad.Path = u.Path + "-tampered"
-	if status, err := verify(&uBad); err == nil || status != http.StatusUnauthorized {
+	if status, err := p.verify(&uBad, orig); err == nil || status != http.StatusUnauthorized {
 		t.Fatalf("expected 401 for tampered path, got status=%d, err=%v", status, err)
 	}
+}
+
+// reconstruct the verifier from the request's own signed query params
+// (pid, smap-ver, nonce, sig) — so the only variable across cases is the URL itself
+func (p *proxy) verify(u *url.URL, orig *http.Request) (int, error) {
+	r := &http.Request{
+		Method:        orig.Method,
+		URL:           u,
+		Host:          u.Host,
+		ContentLength: orig.ContentLength,
+	}
+	q := r.URL.Query()
+	svgrp, err := svgrpFromQ(q)
+	if err != nil {
+		return 0, fmt.Errorf("parse sign/verify params: %w", err)
+	}
+	smap := p.owner.smap.get()
+	pid := q.Get(apc.QparamPID)
+	psi := smap.GetNode(pid)
+	sv := newVerifier(r, &p.htrun, svgrp)
+	return sv.verify(pid, psi, smap)
 }
 
 func TestRedurlSignVerifyDisabledOnV50Bridge(t *testing.T) {

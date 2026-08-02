@@ -261,9 +261,10 @@ func TestMergeCluACLS(t *testing.T) {
 	tests := []struct {
 		title    string
 		cluFlt   string
-		toACLs   cluACLList
-		fromACLs cluACLList
-		resACLs  cluACLList
+		toACLs   []*authn.CluACL
+		fromACLs []*authn.CluACL
+		resACLs  []*authn.CluACL
+		union    bool
 	}{
 		{
 			title: "The same lists",
@@ -471,9 +472,65 @@ func TestMergeCluACLS(t *testing.T) {
 				},
 			},
 		},
+		{
+			title: "Union permissions for the same cluster",
+			union: true,
+			toACLs: []*authn.CluACL{
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0100,
+				},
+			},
+			fromACLs: []*authn.CluACL{
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0010,
+				},
+			},
+			resACLs: []*authn.CluACL{
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0110,
+				},
+			},
+		},
+		{
+			title: "Drop nil entries",
+			union: true,
+			toACLs: []*authn.CluACL{
+				nil,
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0100,
+				},
+			},
+			fromACLs: []*authn.CluACL{
+				nil,
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0010,
+				},
+			},
+			resACLs: []*authn.CluACL{
+				{
+					ID:     "1234",
+					Alias:  "one",
+					Access: 0b0110,
+				},
+			},
+		},
 	}
 	for _, test := range tests {
-		res := mergeClusterACLs(test.toACLs, test.fromACLs, test.cluFlt)
+		res := authn.MergeClusterACLs(test.toACLs, test.fromACLs, test.cluFlt, test.union)
+		if len(res) != len(test.resACLs) {
+			t.Errorf("%s[filter: %s]: length %d != %d", test.title, test.cluFlt, len(res), len(test.resACLs))
+			continue
+		}
 		for i, r := range res {
 			if r.String() != test.resACLs[i].String() || r.Access != test.resACLs[i].Access {
 				t.Errorf("%s[filter: %s]: %v[%v] != %v[%v]", test.title, test.cluFlt, r, r.Access, test.resACLs[i], test.resACLs[i].Access)
@@ -494,9 +551,10 @@ func TestMergeBckACLS(t *testing.T) {
 	tests := []struct {
 		title    string
 		cluFlt   string
-		toACLs   bckACLList
-		fromACLs bckACLList
-		resACLs  bckACLList
+		toACLs   []*authn.BckACL
+		fromACLs []*authn.BckACL
+		resACLs  []*authn.BckACL
+		union    bool
 	}{
 		{
 			title: "Nothing to update",
@@ -680,9 +738,59 @@ func TestMergeBckACLS(t *testing.T) {
 				},
 			},
 		},
+		{
+			title: "Union permissions for the same bucket",
+			union: true,
+			toACLs: []*authn.BckACL{
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0100,
+				},
+			},
+			fromACLs: []*authn.BckACL{
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0010,
+				},
+			},
+			resACLs: []*authn.BckACL{
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0110,
+				},
+			},
+		},
+		{
+			title: "Drop nil entries",
+			union: true,
+			toACLs: []*authn.BckACL{
+				nil,
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0100,
+				},
+			},
+			fromACLs: []*authn.BckACL{
+				nil,
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0010,
+				},
+			},
+			resACLs: []*authn.BckACL{
+				{
+					Bck:    newBck("bck", "ais", "1234"),
+					Access: 0b0110,
+				},
+			},
+		},
 	}
 	for _, test := range tests {
-		res := mergeBckACLs(test.toACLs, test.fromACLs, test.cluFlt)
+		res := authn.MergeBckACLs(test.toACLs, test.fromACLs, test.cluFlt, test.union)
+		if len(res) != len(test.resACLs) {
+			t.Errorf("%s[filter: %s]: length %d != %d", test.title, test.cluFlt, len(res), len(test.resACLs))
+			continue
+		}
 		for i, r := range res {
 			if !r.Bck.Equal(&test.resACLs[i].Bck) || r.Access != test.resACLs[i].Access {
 				t.Errorf("%s[filter: %s]: %v[%v] != %v[%v]", test.title, test.cluFlt, r.Bck, r.Access, test.resACLs[i], test.resACLs[i].Access)

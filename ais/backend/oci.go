@@ -392,7 +392,7 @@ func ociErrorToAISError(op, bucketName, objectPath, byteRange string, errIn erro
 	case http.StatusRequestedRangeNotSatisfiable:
 		errOut = cos.NewErrRangeNotSatisfiable(errIn, []string{byteRange}, 0)
 	case http.StatusTooManyRequests:
-		errOut = cmn.NewErrTooManyRequests(nil, statusCode)
+		errOut = cmn.NewErrTooManyRequests(errIn, statusCode)
 	default:
 		if bucketName == "" {
 			path = objectPath // possibly itself also ""
@@ -484,7 +484,7 @@ func (bp *ocibp) ociClient(bck *cmn.Bck) (*ocios.ObjectStorageClient, string, er
 
 // as core.Backend --------------------------------------------------------------
 
-func (bp *ocibp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, error) {
+func (bp *ocibp) ListObjects(ctx context.Context, bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (int, error) {
 	var (
 		cloudBck            = bck.RemoteBck()
 		continuationToken   string
@@ -503,6 +503,8 @@ func (bp *ocibp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (i
 			Fields:        &fields,
 		}
 	)
+	lst.ContinuationToken = ""
+
 	client, _, err := bp.ociClient(cloudBck)
 	if err != nil {
 		return ociClientToAISError("ListObjects", cloudBck.Name, msg.Prefix, err)
@@ -553,7 +555,7 @@ func (bp *ocibp) ListObjects(bck *meta.Bck, msg *apc.LsoMsg, lst *cmn.LsoRes) (i
 			req.Start = &continuationToken
 		}
 
-		resp, err := client.ListObjects(context.Background(), req)
+		resp, err := client.ListObjects(ctx, req)
 		if err != nil {
 			return ociErrorToAISError("ListObjects", cloudBck.Name, msg.Prefix, "", err, resp)
 		}

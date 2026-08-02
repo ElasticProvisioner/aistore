@@ -1,6 +1,6 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
- * Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -82,6 +82,8 @@ var _ = Describe("EtlMD marshal and unmarshal", func() {
 			DontEvictTime: cos.Duration(time.Hour), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
 		}
 		cmn.GCO.CommitUpdate(config)
+		cmn.Rom.Set(&config.ClusterConfig)
+
 		cfg = cmn.GCO.Get()
 
 		etlMD = newEtlMD()

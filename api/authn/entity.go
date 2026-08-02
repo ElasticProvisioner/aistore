@@ -1,6 +1,6 @@
 // Package authn provides AuthN API over HTTP(S)
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package authn
 
@@ -69,7 +69,7 @@ type (
 // i.e. the user has full access to everything.
 func (u *User) IsAdmin() bool {
 	for _, r := range u.Roles {
-		if r.Name == AdminRole {
+		if r != nil && r.Name == AdminRole {
 			return true
 		}
 	}

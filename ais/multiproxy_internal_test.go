@@ -1,6 +1,6 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
@@ -62,12 +62,13 @@ func newDiscoverServerPrimary() *proxy {
 
 	cmn.Rom.Set(&config.ClusterConfig)
 
-	p.owner.smap = newSmapOwner(config)
+	p.owner.smap = newSmapOwner(config, false /*isTarget*/)
 	p.owner.smap.put(newSmap())
 	owner := newBMDOwnerPrx(config)
 	owner.put(newBucketMD())
 	p.owner.bmd = owner
 	p.keepalive = newPalive(p, tracker, atomic.NewBool(true))
+	p.htrun.svs.init()
 	return p
 }
 

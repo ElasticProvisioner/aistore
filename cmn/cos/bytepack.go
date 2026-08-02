@@ -1,6 +1,6 @@
 // Package cos provides common low-level types and utilities for all aistore projects
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package cos
 
@@ -206,6 +206,11 @@ func (br *ByteUnpack) ReadMapStrUint16() (MapStrUint16, error) {
 	l, err := br.ReadInt32()
 	if err != nil {
 		return nil, err
+	}
+	// Reject negative counts and counts that cannot fit in the remaining buffer:
+	// each entry requires at least a string-length marker and a uint16 value.
+	if l < 0 || int64(l) > int64(br.Len())/int64(SizeofLen+SizeofI16) {
+		return nil, errBufferUnderrun
 	}
 	mp := make(MapStrUint16, l)
 	for ; l > 0; l-- {

@@ -176,6 +176,9 @@ func TestMPU_2_UsingScript(t *testing.T) {
 	bck := cmn.Bck{Name: trand.String(10), Provider: apc.AIS}
 	cmd := exec.Command("./scripts/multipart-smoke.sh", "--bucket", bck.Cname(""))
 
+	// check feat.S3ReverseProxy and maybe set feat.S3RedirectRebuild
+	tools.PrepForS3RebuildClientOrSkip(t)
+
 	tlog.Logfln("Running '%s'...)", cmd.String())
 	out, err := cmd.CombinedOutput()
 	if len(out) > 0 {

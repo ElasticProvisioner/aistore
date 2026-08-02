@@ -1,11 +1,10 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package ais
 
 import (
-	"flag"
 	"io"
 	"net/http"
 	"os"
@@ -18,8 +17,6 @@ import (
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core"
 	"github.com/NVIDIA/aistore/core/meta"
-	"github.com/NVIDIA/aistore/core/mock"
-	"github.com/NVIDIA/aistore/fs"
 	"github.com/NVIDIA/aistore/tools/readers"
 	"github.com/NVIDIA/aistore/tools/tassert"
 )
@@ -27,13 +24,6 @@ import (
 const (
 	testMountpath = "/tmp/ais-test-mpath" // mpath is created and deleted during the test
 	testBucket    = "bck"
-)
-
-var (
-	t *target
-
-	// interface guard
-	_ http.ResponseWriter = (*discardRW)(nil)
 )
 
 type (
@@ -51,46 +41,6 @@ func newDiscardRW() *discardRW {
 func (drw *discardRW) Write(p []byte) (int, error) { return drw.w.Write(p) }
 func (*discardRW) Header() http.Header             { return make(http.Header) }
 func (*discardRW) WriteHeader(int)                 {}
-
-func TestMain(m *testing.M) {
-	flag.Parse()
-
-	// file system
-	cos.CreateDir(testMountpath)
-	defer os.RemoveAll(testMountpath)
-	fs.NewTestMFS(nil)
-
-	// target
-	config := cmn.GCO.Get()
-	config.Log.Level = "3"
-	co := newConfigOwner(config)
-	t = newTarget(co)
-	t.initPhase1(config)
-	tid, _ := initTID(config)
-	t.si.Init(tid, apc.Target, nil /*verifying key*/)
-
-	fs.AddTestMpath(testMountpath, t.SID())
-
-	t.htrun.initPhase2(config)
-	t.ups.t = t
-
-	t.statsT = mock.NewStatsTracker()
-	core.Tinit(t, config, false)
-
-	bck := meta.NewBck(testBucket, apc.AIS, cmn.NsGlobal)
-	bmd := newBucketMD()
-	bmd.add(bck, &cmn.Bprops{
-		Cksum: cmn.CksumConf{
-			Type: cos.ChecksumNone,
-		},
-	})
-	t.owner.bmd.putPersist(bmd, nil)
-	fs.CreateBucket(bck.Bucket(), false /*nilbmd*/)
-
-	t.owner.smap.put(newSmap()) // Note: required by ais/txn_internal_test.go
-
-	m.Run()
-}
 
 func TestPutObjectChunks(tst *testing.T) {
 	tests := []struct {
@@ -141,7 +91,7 @@ func TestPutObjectChunks(tst *testing.T) {
 			config := cmn.GCO.Get()
 			poi := &putOI{
 				atime:   time.Now().UnixNano(),
-				t:       t, // Reuse global target initialized in TestMain
+				t:       mockTarget, // global target initialized in TestMain
 				lom:     lom,
 				r:       reader,
 				oreq:    &http.Request{Header: make(http.Header)},
@@ -203,7 +153,7 @@ func BenchmarkObjPut(b *testing.B) {
 				r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: bench.fileSize, CksumType: cos.ChecksumNone})
 				poi := &putOI{
 					atime:   time.Now().UnixNano(),
-					t:       t,
+					t:       mockTarget,
 					lom:     lom,
 					r:       r,
 					workFQN: path.Join(testMountpath, "objname.work"),
@@ -251,7 +201,7 @@ func BenchmarkObjAppend(b *testing.B) {
 				r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: bench.fileSize, CksumType: cos.ChecksumNone})
 				aoi := &apndOI{
 					started: time.Now().UnixNano(),
-					t:       t,
+					t:       mockTarget,
 					lom:     lom,
 					r:       r,
 					op:      apc.AppendOp,
@@ -311,7 +261,7 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 			r, _ := readers.New(&readers.Arg{Type: readers.Rand, Size: bench.fileSize, CksumType: cos.ChecksumNone})
 			poi := &putOI{
 				atime:   time.Now().UnixNano(),
-				t:       t,
+				t:       mockTarget,
 				lom:     lom,
 				r:       r,
 				workFQN: path.Join(testMountpath, "objname.work"),
@@ -329,7 +279,7 @@ func BenchmarkObjGetDiscard(b *testing.B) {
 			w := newDiscardRW()
 			goi := &getOI{
 				atime:   time.Now().UnixNano(),
-				t:       t,
+				t:       mockTarget,
 				lom:     lom,
 				w:       w,
 				chunked: bench.chunked,

@@ -3,9 +3,12 @@ AIStore can scale from a **single Linux machine** to a **rack-scale cluster** or
 ## Contents
 * [Deployment Considerations](#deployment-considerations)
 * [Prerequisites](#prerequisites)
+* [Choose an onboarding path](#choose-an-onboarding-path)
 * [Quick Start](#quick-start)
 * [Next Steps](#next-steps)
   * [Local Playground](#local-playground)
+  * [Minimal Compose deployment](#minimal-compose-deployment)
+  * [Local Playground environment variables](#local-playground-environment-variables)
   * [Make](#make)
   * [System environment variables](#system-environment-variables)
   * [Multiple deployment options](#multiple-deployment-options)
@@ -83,11 +86,22 @@ $ find . -name "*darwin*"
 
 Benchmarking and stress-testing is done on Linux only - another reason to consider Linux (and only Linux) for production deployments.
 
+## Choose an onboarding path
+
+Use the path that matches what you want to do first:
+
+| Goal | Start here | Notes |
+| --- | --- | --- |
+| Try AIS locally from source | [Local Playground](#local-playground) | Most frequently used local path for first-time evaluation and development. Uses the top-level `Makefile`, `deploy/dev/local`, and optionally `scripts/clean_deploy.sh`. |
+| Develop with containerized AIS nodes | [Docker development scripts](/deploy/dev/docker/README.md) | Uses `deploy/dev/docker` and the top-level `make deploy-docker` target. |
+| Exercise AIS in local Kubernetes | [Local K8s deployment](/deploy/dev/k8s/README.md) | Uses `deploy/dev/k8s` for KinD or Minikube based development and testing. |
+| Plan a production Kubernetes deployment | [AIS/K8s repository](https://github.com/NVIDIA/ais-k8s) | Operator, Ansible playbooks, Helm charts, and monitoring live in the dedicated Kubernetes repository. |
+| Run a small container smoke test | [Minimal Compose deployment](#minimal-compose-deployment) | Validate this path against the current Compose README before relying on it; it is not the primary maintained onboarding path. |
+| Connect applications or secure a cluster | [Python SDK](https://docs.nvidia.com/aistore/python/aistore/sdk) and [AuthN](/docs/authn.md) | Use these after you have an AIS endpoint, for example `AIS_ENDPOINT=http://localhost:51080` or `AIS_ENDPOINT=http://localhost:8080`. |
+
 ## Quick Start
 
-This section provides the fastest way to get an AIStore cluster running on your local machine. For more detailed steps, see the [Local Playground](#local-playground) section.
-
-> **Docker shortcut**: If you already have Docker or Podman, you can skip everything below and get a running cluster in seconds with `make up` - see [Minimal Compose Deployment](https://github.com/NVIDIA/aistore/blob/main/deploy/prod/docker/compose/README.md).
+This section provides the fastest maintained path to get an AIStore cluster running on your local machine. For more detailed steps, see the [Local Playground](#local-playground) section.
 
 ### Install Go (if not already installed)
 
@@ -320,6 +334,30 @@ See also:
 > [cluster and node configuration](configuration.md);
 > [supported deployments: summary table and links](https://github.com/NVIDIA/aistore/blob/main/deploy/README.md).
 
+### Minimal Compose deployment
+
+For a compact container smoke test with one gateway and one target, you can use the Compose setup in `deploy/prod/docker/compose`. Treat this as a small validation path, not the primary onboarding path; check the current Compose README and run the smoke test before relying on it.
+
+```console
+$ cd deploy/prod/docker/compose
+$ make up
+$ export AIS_ENDPOINT="http://localhost:51080"
+$ ais show cluster
+```
+
+Useful follow-up commands from the same directory:
+
+```console
+$ make status
+$ make logs
+$ make down
+$ make clean
+```
+
+Use `make up-build` instead of `make up` when you need to build the image from the current source tree. The Compose Makefile auto-detects Podman or Docker Compose; override it with `COMPOSE="docker compose"` if needed.
+
+This path is intentionally small. For more nodes, development-only Docker scripts, or multiple containerized clusters, use [`deploy/dev/docker`](/deploy/dev/docker/README.md). For Kubernetes, use [`deploy/dev/k8s`](/deploy/dev/k8s/README.md) locally or the production [ais-k8s](https://github.com/NVIDIA/ais-k8s) repository.
+
 #### Running Local Playground remotely
 
 AIStore (product and solution) is fully based on HTTP(S) utilizing the protocol both externally (to support both frontend interfaces and communications with remote backends) and internally, for [intra-cluster streaming](/transport).
@@ -355,6 +393,66 @@ index e0b467d82..b18361155 100755                                               
  if $AIS_USE_HTTPS; then                                                                                                                         |
    AIS_PRIMARY_URL="https://localhost:$PORT"                                                                                                     |
 ```
+
+#### Local Playground environment variables
+
+The Local Playground deployment scripts generate AIStore configuration from a combination of defaults, interactive prompts, and optional environment variables.
+
+The generated configuration is primarily produced by:
+
+```console
+deploy/dev/local/aisnode_config.sh
+```
+
+Most users do not need to set any of these variables. They are intended for development, testing, CI, and quickly exercising selected configuration paths without editing JSON files by hand.
+
+For example:
+
+```console
+$ TAGS="aws gcp debug" make kill clean cli deploy <<< $'3\n3\n4'
+
+$ ais config cluster mirror.enabled true
+PROPERTY                 VALUE
+mirror.copies            2
+mirror.burst_buffer      512
+mirror.enabled           true
+
+Cluster config updated
+```
+
+or:
+
+```console
+$ AIS_AUTHN_ENABLED=true AIS_AUTHN_SECRET_KEY=secret make kill clean cli authn deploy <<< $'1\n1\n4'
+```
+
+Commonly used variables include:
+
+| Area                            | Variables                                                                                                                                                                                                                                       | Notes                                                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Build/linkage                   | `TAGS`, `MODE`, `AIS_BACKEND_PROVIDERS`                                                                                                                                                                                                         | Select build tags, debug mode, and conditionally linked backend providers.                                                |
+| Authentication                  | `AIS_AUTHN_ENABLED`, `AIS_AUTHN_SECRET_KEY`, `AIS_AUTHN_PUBLIC_KEY`, `AIS_AUTHN_ALLOWED_ISS`                                                                                                                                                    | Configure JWT validation. When `AIS_AUTHN_ENABLED=true`, one of HMAC, RSA, or OIDC issuer configuration must be provided. |
+| Intra-cluster protection        | `AIS_AUTH_INTRA_CLUSTER_ENABLED`, `AIS_AUTH_INTRA_CLUSTER_TTL`, `AIS_AUTH_INTRA_CLUSTER_NONCE_WINDOW`, `AIS_AUTH_INTRA_CLUSTER_ROTATION_GRACE`                                                                                                  | Configure protection for selected intra-cluster requests. This is independent from `AIS_AUTHN_ENABLED`.                   |
+| HTTPS/TLS                       | `AIS_USE_HTTPS`, `AIS_SERVER_CRT`, `AIS_SERVER_KEY`, `AIS_CLIENT_CA_TLS`, `AIS_CLIENT_AUTH_TLS`, `AIS_SKIP_VERIFY_CRT`                                                                                                                          | Enable and configure local HTTPS. For details, see [HTTPS](https.md).                                                     |
+| Network/listeners               | `HOSTNAME_LIST`, `HOSTNAME_LIST_INTRA_CONTROL`, `HOSTNAME_LIST_INTRA_DATA`, `PORT`, `PORT_INTRA_CONTROL`, `PORT_INTRA_DATA`, `AIS_PRIMARY_URL`, `AIS_DISCOVERY_URL`, `AIS_USE_IPv6`                                                             | Configure public, intra-control, and intra-data addresses and ports.                                                      |
+| Local paths                     | `AIS_CONF_DIR`, `AIS_LOG_DIR`, `TEST_FSPATH_ROOT`, `TEST_FSPATH_COUNT`, `AIS_FS_PATHS`                                                                                                                                                          | Configure local config, logs, and mountpath layout.                                                                       |
+| Rebalance, transport, and dSort | `AIS_REBALANCE_COMPRESSION`, `AIS_REBALANCE_BUNDLE_MULTIPLIER`, `AIS_TRANSPORT_IDLE_TEARDOWN`, `AIS_TRANSPORT_QUIESCENT`, `AIS_TRANSPORT_LZ4_BLOCK`, `AIS_TRANSPORT_LZ4_FRAME_CHECKSUM`, `AIS_DSORT_COMPRESSION`, `AIS_DSORT_BUNDLE_MULTIPLIER` | Exercise selected data-movement configuration paths.                                                                      |
+| Space, disk, and logging        | `AIS_SPACE_LOWWM`, `AIS_SPACE_HIGHWM`, `AIS_SPACE_OOS`, `AIS_IOSTAT_TIME_LONG`, `AIS_IOSTAT_TIME_SHORT`, `AIS_LOG_LEVEL`                                                                                                                        | Override selected local thresholds and diagnostics.                                                                       |
+| HTTP client/server behavior     | `HTTP_WRITE_BUFFER_SIZE`, `HTTP_READ_BUFFER_SIZE`, `AIS_HTTP_CHUNKED_TRANSFER`, `SNDRCV_BUF_SIZE`                                                                                                                                               | Tune selected HTTP and socket settings.                                                                                   |
+
+The table above is intentionally not exhaustive. The source of truth is the script itself, and for developers the fastest way to discover the currently supported deployment-time knobs is still:
+
+```console
+$ grep -n '\${[A-Z_][A-Z0-9_]*' deploy/dev/local/aisnode_config.sh
+```
+
+and also:
+
+```console
+$ make help
+```
+
+> There is a separate set of runtime environment variables used by the CLI, SDKs, and deployed AIS processes, such as `AIS_ENDPOINT` and `AIS_AUTHN_TOKEN_FILE`. See [System environment variables](#system-environment-variables) below.
 
 ### Make
 
@@ -482,7 +580,7 @@ For production deployments, we developed the [AIS/K8s Operator](https://github.c
 
 #### Minimal container-based Deployment
 
-This option has the unmatched convenience of requiring an absolute minimum time and resources - please see this [README](/deploy/prod/docker/compose/README.md) for details.
+This option has the unmatched convenience of requiring an absolute minimum time and resources. See [Minimal Compose deployment](#minimal-compose-deployment) above and the Compose [README](/deploy/prod/docker/compose/README.md) for details.
 
 #### Testing your cluster
 
@@ -591,10 +689,10 @@ There's a separate document that tackles HTTPS topics that, in part, include:
 
 - [Generating self-signed certificates](/docs/https.md#generating-self-signed-certificates)
 - [Deploying: 4 targets, 1 gateway, 6 mountpaths, AWS backend](/docs/https.md#deploying-4-targets-1-gateway-6-mountpaths-aws-backend)
-- [Accessing the cluster](/docs/https.md#accessing-the-cluster)
+- [Accessing HTTPS-based cluster](/docs/https.md#accessing-https-based-cluster)
 - [Testing with self-signed certificates](/docs/https.md#testing-with-self-signed-certificates)
 - [Updating and reloading X.509 certificates](/docs/https.md#updating-and-reloading-x509-certificates)
-- [Switching cluster between HTTP and HTTPS](/docs/https.md#switching-cluster-between-http-and-https)
+- [Switching cluster between HTTP and HTTPS](/docs/switch_https.md)
 
 ### Build, Make, and Development Tools
 

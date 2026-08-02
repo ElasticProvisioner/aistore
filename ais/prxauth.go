@@ -395,37 +395,19 @@ func aceErrToCode(err error) (status int) {
 
 // Validate the given header contains a token allowing access to the given bucket with the requested permissions
 // All failures must be logged at this level
-//
 // When AuthN is on, accessing a bucket requires two permissions:
-//   - access to the bucket is granted to a user
-//   - bucket ACL allows the required operation
-//     Exception: a superuser can always PATCH the bucket/Set ACL
+// - access to the bucket is granted to a user
+// - bucket ACL allows the required operation
+// - Exception: a superuser can always PATCH the bucket/Set ACL
 //
-// If AuthN is off, only bucket permissions are checked.
+// If AuthN is off, only bucket permissions are checked. Exceptions:
+// - read-only access to a bucket is always granted
+// - PATCH cannot be forbidden
 //
-//	Exceptions:
-//	- read-only access to a bucket is always granted
-//	- PATCH cannot be forbidden
+// NOTE:
+// - access() is reached  only from pub-net handlers; intra-cluster auth lives in htrun checkIntra/parseReq.
 func (p *proxy) access(r *http.Request, bck *meta.Bck, ace apc.AccessAttrs) (err error) {
-	var (
-		hdr     = r.Header
-		sid     = hdr.Get(apc.HdrSenderID)
-		sname   = hdr.Get(apc.HdrSenderName)
-		isIntra = sid != "" || sname != ""
-	)
-	if isIntra {
-		// HMAC-verify
-		verifying := cmn.Rom.AuthEnabled() && cmn.Rom.SignVerifyEnabled() && !g.netServ.pub.isSeparatePub
-		if verifying {
-			return p.verifyIntra(r, sid, sname)
-		}
-		smap := p.owner.smap.get()
-		if !smap.isValid() || smap.GetNode(sid) != nil {
-			return nil
-		}
-	}
-
-	// If auth is NOT enabled, only check bucket properties
+	// auth is not enabled: check bucket properties
 	if !cmn.Rom.AuthEnabled() {
 		if bck == nil || bck.Props == nil {
 			return nil
@@ -439,15 +421,14 @@ func (p *proxy) access(r *http.Request, bck *meta.Bck, ace apc.AccessAttrs) (err
 		return err
 	}
 
-	// System buckets: require admin
+	// token & claims:
+	// - system buckets: require admin
 	// - note that majority of control flows that operate on bucket(s) validate perm-s via bckArgs.initAndTry() => p.access()
 	// - the rest that pass `bck == nil` MUST explicitly add apc.AceAdmin
 	if bck != nil && bck.Bucket().IsSystem() {
 		ace |= apc.AceAdmin
 	}
-
-	// Validate token and parse claims ONCE
-	claims, err := p.validateToken(r.Context(), hdr)
+	claims, err := p.validateToken(r.Context(), r.Header)
 	if err != nil {
 		// NOTE: making exception to allow 3rd party clients read remote ht://bucket
 		if errors.Is(err, tok.ErrNoToken) && bck != nil && bck.IsHT() {

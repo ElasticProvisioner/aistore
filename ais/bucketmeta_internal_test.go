@@ -1,4 +1,4 @@
-// Package ais provides AIStore's proxy and target nodes.
+// Package ais: internal unit tests
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
@@ -42,6 +42,8 @@ var _ = Describe("BMD marshal and unmarshal", func() {
 			DontEvictTime: cos.Duration(time.Hour), CapacityUpdTime: cos.Duration(time.Minute), Enabled: true,
 		}
 		cmn.GCO.CommitUpdate(config)
+		cmn.Rom.Set(&config.ClusterConfig)
+
 		cfg = cmn.GCO.Get()
 
 		bmd = newBucketMD()

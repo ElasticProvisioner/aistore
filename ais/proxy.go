@@ -101,9 +101,8 @@ func (p *proxy) init(config *cmn.Config) {
 	// - in that sequence
 	pid := initPID(config)
 
-	p.htrun.nodeSigningKey, _ = initProxySigningKey(pid, config)
-
-	p.si.Init(pid, apc.Proxy, p.htrun.nodeSigningKey.VerifyingKey)
+	keyPair := p.newKeyPair(pid, apc.Proxy)
+	p.si.Init(pid, apc.Proxy, keyPair.VerifyingKey)
 
 	memsys.Init(p.SID(), p.SID(), config)
 
@@ -181,55 +180,6 @@ func readProxyID(config *cmn.Config) (pid string) {
 	return pid
 }
 
-func initProxySigningKey(pid string, config *cmn.Config) (pair *cos.NodeSigningKey, generated bool) {
-	err := cos.ValidateDaemonID(pid)
-	cos.AssertNoErr(err) // FATAL
-
-	path := filepath.Join(config.ConfigDir, fname.ProxySigningKey)
-
-	pair, err = _loadProxySigningKey(path, pid)
-	switch {
-	case err != nil:
-		cos.ExitLog(err) // FATAL
-	case pair != nil:
-		fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
-		debug.AssertNoErr(err)
-		nlog.Infof("loaded node signing key for %s, verifying-key fp %s", meta.Pname(pid), fp)
-		return pair, false
-	}
-
-	// generate
-	pub, priv, err := cos.GenerateNodeSigningKey()
-	if err != nil {
-		cos.ExitLog(fmt.Errorf("failed to generate node signing key for %s: %w", meta.Pname(pid), err))
-	}
-	pair = cos.NewNodeSigningKey(priv, pub)
-
-	if err := os.WriteFile(path, pair.Bytes(pid), 0o600); err != nil {
-		cos.ExitLog(fmt.Errorf("failed to persist proxy signing key %q: %w", path, err))
-	}
-
-	fp, err := cos.NodeSigningKeyFingerprint(pair.VerifyingKey)
-	debug.AssertNoErr(err)
-	nlog.Infof("generated node signing key for %s, verifying-key fp %s", meta.Pname(pid), fp)
-	return pair, true
-}
-
-func _loadProxySigningKey(path, pid string) (*cos.NodeSigningKey, error) {
-	b, err := os.ReadFile(path)
-	if err == nil {
-		pair, err := cos.UnpackNodeSigningKey(pid, b)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy signing key %q: %w", path, err)
-		}
-		return pair, nil
-	}
-	if cos.IsNotExist(err) {
-		return nil, nil
-	}
-	return nil, fmt.Errorf("failed to read proxy signing key %q: %w", path, err)
-}
-
 func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebalance */) error {
 	const msg = "%s primary: not ready yet "
 	debug.Assert(smap == nil || smap.IsPrimary(p.si))
@@ -282,20 +232,23 @@ func (p *proxy) Run() error {
 }
 
 // register API handlers
+// NOTE explicit (apc.Reverse, apc.Cluster, apc.Daemon) split -
+// with added netServer's ConnContext() wiring the corresponding compile-time `isPub`
+// delineation can be simplified out (see reqIsPub asserts in the code)
 func (p *proxy) initRecvHandlers() {
 	networkHandlers := make([]networkHandler, 0, 28)
 	networkHandlers = append(networkHandlers,
 		// (pub + control): apc.Reverse
 		networkHandler{r: apc.Reverse, h: p.revPubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Reverse, h: p.revHandler, net: accessNetIntraControl | accessNetNoPubFallback},
+		networkHandler{r: apc.Reverse, h: p.revHandler, net: accessNetIntraControl},
 
 		// (pub + control): apc.Cluster
 		networkHandler{r: apc.Cluster, h: p.cluPubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Cluster, h: p.cluHandler, net: accessNetIntraControl | accessNetNoPubFallback},
+		networkHandler{r: apc.Cluster, h: p.cluHandler, net: accessNetIntraControl},
 
 		// (pub + control): apc.Daemon
 		networkHandler{r: apc.Daemon, h: p.daePubHandler, net: accessNetPublic},
-		networkHandler{r: apc.Daemon, h: p.daeHandler, net: accessNetIntraControl | accessNetNoPubFallback},
+		networkHandler{r: apc.Daemon, h: p.daeHandler, net: accessNetIntraControl},
 
 		// pub-net handlers: cluster must be started
 		networkHandler{r: apc.Buckets, h: p.bucketHandler, net: accessNetPublic},
@@ -307,9 +260,14 @@ func (p *proxy) initRecvHandlers() {
 		networkHandler{r: apc.Tokens, h: p.tokenHandler, net: accessNetPublic},
 
 		networkHandler{r: apc.Metasync, h: p.metasyncHandler, net: accessNetIntraControl},
-		networkHandler{r: apc.Health, h: p.healthHandler, net: accessNetPublicControl},
-		networkHandler{r: apc.Vote, h: p.voteHandler, net: accessNetIntraControl},
 
+		// TODO:
+		// - accessNetPublicControl is a union (pub) and (control);
+		// - to enforce intra-cluster headers and sign/verify (if enabled):
+		// - follow-up on 0cd8ff1078ee "access control: split public and intra-control handlers"
+		networkHandler{r: apc.Health, h: p.healthHandler, net: accessNetPublicControl},
+
+		networkHandler{r: apc.Vote, h: p.voteHandler, net: accessNetIntraControl},
 		networkHandler{r: apc.Notifs, h: p.notifs.handler, net: accessNetIntraControl},
 		networkHandler{r: apc.EC, h: p.ecHandler, net: accessNetIntraControl},
 
@@ -903,8 +861,6 @@ func (p *proxy) httpobjget(w http.ResponseWriter, r *http.Request, origURLBck ..
 		return
 	}
 
-	started := time.Now()
-
 	// 3. rate limit
 	smap := p.owner.smap.get()
 	if ecode, err := p.ratelimit(bck, http.MethodGet, smap); err != nil {
@@ -923,7 +879,7 @@ func (p *proxy) httpobjget(w http.ResponseWriter, r *http.Request, origURLBck ..
 		nlog.Infoln("GET", bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
 	http.Redirect(w, r, redurl, http.StatusMovedPermanently)
 
 	// 5. stats
@@ -995,7 +951,6 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 	// 4. redirect
 	var (
 		tsi     *meta.Snode
-		started = time.Now()
 		objName = apireq.items[1]
 		netPub  = cmn.NetPublic
 	)
@@ -1026,7 +981,7 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 		nlog.Infoln(verb, bck.Cname(objName), "=>", tsi.StringEx())
 	}
 
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraData, netPub)
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraData, netPub)
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 
 	// 5. stats
@@ -1070,8 +1025,7 @@ func (p *proxy) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 	if cmn.Rom.V(5, cos.ModAIS) {
 		nlog.Infoln("DELETE", bck.Cname(objName), "=>", tsi.StringEx())
 	}
-	started := time.Now()
-	redurl := p.redurl(r, tsi, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	redurl := p.redurl(r, tsi, smap.Version, cmn.NetIntraControl, "")
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 
 	p.statsT.IncBck(stats.DeleteCount, bck.Bucket())
@@ -1225,6 +1179,10 @@ func (p *proxy) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !p.ensureIntraControl(w, r, true /* from primary */) {
+		return
+	}
+
 	p.warnMsync(r, smap)
 
 	payload := make(msPayload)
@@ -1332,11 +1290,24 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 		mustBePrimary = askPrimary || pir
 	}
 
+	var admitted bool
+
 	// 2. ordinary liveness/readiness probe
 	if !prr && !wantNsti {
-		if responded := p.externalWD(w, r); responded {
+		plainPing := !mustBePrimary // i.e., !askPrimary
+		if responded := p._health(w, r, plainPing); responded {
 			return
 		}
+		// arrived via intra-control and checkIntra passed
+		admitted = true
+	}
+	// prr is public on pub-net, but must be admitted when received via intra-control
+	if prr && _reqNet(r) == reqNetCtrl {
+		if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
+			p.writeErr(w, r, err, ecode)
+			return
+		}
+		admitted = true
 	}
 
 	// 3. cluster-info from any node (no Smap validation required for the bare cii case)
@@ -1358,7 +1329,7 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	senderID = r.Header.Get(apc.HdrSenderID)
-	if senderID != "" && smap.GetProxy(senderID) != nil {
+	if senderID != "" && smap.GetProxy(senderID) != nil && admitted {
 		p.keepalive.heardFrom(senderID)
 	}
 
@@ -1406,6 +1377,42 @@ func (p *proxy) healthHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+func (p *proxy) _health(w http.ResponseWriter, r *http.Request, plainPing bool) bool {
+	if _reqNet(r) == reqNetCtrl {
+		if ecode, err := p.checkIntra(r, false /*only primary*/); err != nil {
+			if plainPing {
+				if cmn.Rom.V(4, cos.ModAIS) {
+					nlog.Warningln("[health]", p.String(), "rejected intra-control request:", err)
+				}
+				w.WriteHeader(http.StatusOK) // liveness only
+			} else {
+				p.writeErr(w, r, err, ecode)
+			}
+			return true
+		}
+		return false
+	}
+
+	// substring match to avoid ParseQuery alloc on fast path
+	// (the apc constant includes "=true")
+	isReadiness := strings.Contains(r.URL.RawQuery, apc.QparamHealthReady)
+	if cmn.Rom.V(5, cos.ModKalive) {
+		nlog.Infoln(p.String(), "external health-probe:", r.RemoteAddr, isReadiness, "[", r.URL.RawQuery, "]")
+	}
+
+	if !isReadiness {
+		w.WriteHeader(http.StatusOK)
+		return true
+	}
+
+	if p.isReady() {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	return true
 }
 
 // +gen:endpoint PUT /v1/buckets/{bucket-name}[apc.QparamProvider=string,apc.QparamNamespace=string] action=[apc.ActArchive=cmn.ArchiveBckMsg]
@@ -1639,7 +1646,9 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 			return
 		}
 		tcbmsg.Prefix = cos.TrimPrefix(tcbmsg.Prefix)
-		if bckFrom.Equal(bckTo, true /*same BID*/, true) {
+		// Same-bucket dry-run is safe for copy and ETL: it exercises the TCB path
+		// without writing objects. ETL inspection uses this request shape.
+		if !tcbmsg.DryRun && bckFrom.Equal(bckTo, true /*same BID*/, true) {
 			if !bckFrom.IsRemote() {
 				p.writeErrf(w, r, "cannot %s bucket %q onto itself", msg.Action, bckFrom.Cname(""))
 				return
@@ -2423,15 +2432,13 @@ func (p *proxy) httpobjhead(w http.ResponseWriter, r *http.Request, origURLBck .
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
 	}
 
-	started := time.Now()
-	redurl := p.redurl(r, si, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	redurl := p.redurl(r, si, smap.Version, cmn.NetIntraControl, "")
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 }
 
 // +gen:endpoint PATCH /v1/objects/{bucket-name}/{object-name}[apc.QparamProvider=string,apc.QparamNamespace=string]
 // Update object metadata and custom properties
 func (p *proxy) httpobjpatch(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
 	bckArgs := allocBctx()
 	{
 		bckArgs.p = p
@@ -2457,7 +2464,7 @@ func (p *proxy) httpobjpatch(w http.ResponseWriter, r *http.Request) {
 	if cmn.Rom.V(5, cos.ModAIS) {
 		nlog.Infoln(r.Method, bck.Cname(objName), "=>", si.StringEx())
 	}
-	redurl := p.redurl(r, si, smap.Version, started.UnixNano(), cmn.NetIntraControl, "")
+	redurl := p.redurl(r, si, smap.Version, cmn.NetIntraControl, "")
 	http.Redirect(w, r, redurl, http.StatusTemporaryRedirect)
 }
 
@@ -2574,6 +2581,8 @@ func (p *proxy) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
 		cmn.WriteErr405(w, r, http.MethodGet, http.MethodPost, http.MethodPut)
 		return
 	}
+
+	debug.Assert(reqIsPub(r) == isPub)
 	if isPub {
 		if err := p.checkAccess(w, r, nil, ace); err != nil {
 			return
@@ -2798,20 +2807,6 @@ func (p *proxy) daeputItems(w http.ResponseWriter, r *http.Request, apiItems []s
 	switch apiItems[0] {
 	case apc.Proxy:
 		p.daeSetPrimary(w, r)
-	case apc.SyncSmap:
-		newsmap := &smapX{}
-		if cmn.ReadJSON(w, r, newsmap) != nil {
-			return
-		}
-		if err := newsmap.validate(); err != nil {
-			p.writeErrf(w, r, "%s: invalid %s: %v", p.si, newsmap, err)
-			return
-		}
-		if err := p.owner.smap.synchronize(p.si, newsmap, nil /*ms payload*/, p.htrun.smapUpdatedCB); err != nil {
-			p.writeErr(w, r, cmn.NewErrFailedTo(p, "synchronize", newsmap, err))
-			return
-		}
-		nlog.Infof("%s: %s %s done", p, apc.SyncSmap, newsmap)
 	case apc.ActSetConfig: // set-config #1 - via query parameters and "?n1=v1&n2=v2..."
 		p.setDaemonConfigQuery(w, r)
 	case apc.LoadX509:
@@ -3348,7 +3343,7 @@ func (p *proxy) notifyCandidate(npsi *meta.Snode, smap *smapX) {
 	if err != nil {
 		return
 	}
-	p.setIntraHdrs(req, smap)
+	p.setIntraHdrs(req, smap, true)
 	g.client.control.Do(req) //nolint:bodyclose // exiting
 	cmn.HreqFree(req)
 }
