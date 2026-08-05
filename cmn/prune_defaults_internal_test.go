@@ -9,6 +9,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn/cos"
 
 	jsoniter "github.com/json-iterator/go"
 )
@@ -16,12 +20,12 @@ import (
 // The authoritative set of ClusterConfig sections participating in sparse
 // persistence. Adding a pointerized section does not implicitly join this set:
 // it must implement defaultOmittable and be listed here.
-//
-// v5.0: ec and mirror joined the set. Their pre-v5.0 validators hard-error on a
-// zero section (ec.data_slices < 1, mirror.copies < 2), so a config persisted by
-// v5.0 cannot be read by a pre-v5.0 node - downgrade below v5.0 is unsupported.
-// Contrast tcb/tco/arch/lso, which pre-v5.0 hydrates via XactConf.Validate().
-var expectedOmittable = []string{"TCB", "TCO", "Arch", "Lso", "Chunks", "EC", "Mirror"}
+var expectedOmittable = []string{
+	"TCB", "TCO", "Arch", "Lso", "Chunks", "EC", "Mirror",
+	"Cksum", "Disk", "Periodic", "Downloader", "RateLimit", "WritePolicy",
+	"Transport", "Log", "Client", "Space",
+	"GetBatch", "LRU", "FSHC", "Keepalive", "Rebalance",
+}
 
 func omittableNames(c *ClusterConfig) []string {
 	var names []string
@@ -55,7 +59,7 @@ func TestOmittableCoverage(t *testing.T) {
 // values could prevent otherwise-default sections from being stripped.
 func TestOmittableValueTypesOnly(t *testing.T) {
 	c := &ClusterConfig{}
-	c.ensureDefaults()
+	c.allocOmittables()
 
 	c.rangeDefaultOmittable(func(sf *reflect.StructField, field reflect.Value) {
 		var walk func(reflect.Type, string)
@@ -81,7 +85,7 @@ func TestOmittableValueTypesOnly(t *testing.T) {
 // An all-default config must persist with every omittable section absent.
 func TestPruneAllDefault(t *testing.T) {
 	c := &ClusterConfig{}
-	c.ensureDefaults()
+	c.allocOmittables()
 	validateOmittable(t, c)
 
 	c.PruneOmittables()
@@ -97,7 +101,7 @@ func TestPruneAllDefault(t *testing.T) {
 // stripping must also work for zero-valued, unhydrated sections.
 func TestPruneUnvalidated(t *testing.T) {
 	c := &ClusterConfig{}
-	c.ensureDefaults() // allocate, but deliberately skip validation
+	c.allocOmittables() // zero-valued by construction: no validation here
 
 	c.PruneOmittables()
 
@@ -112,7 +116,7 @@ func TestPruneUnvalidated(t *testing.T) {
 // zero-valued siblings. Those are hydrated on load, not while pruning.
 func TestPruneRetainsNonDefault(t *testing.T) {
 	c := &ClusterConfig{}
-	c.ensureDefaults()
+	c.allocOmittables()
 	c.Lso.WalkBuffer = lsoWalkBufDflt * 2
 
 	c.PruneOmittables()
@@ -146,7 +150,7 @@ func TestPruneRetainsNonDefault(t *testing.T) {
 // copy does not mutate the source.
 func TestPruneRoundTrip(t *testing.T) {
 	orig := &ClusterConfig{}
-	orig.ensureDefaults()
+	orig.allocOmittables()
 	validateOmittable(t, orig)
 
 	// Deliberately shallow: PruneOmittables must not mutate shared sections.
@@ -162,7 +166,7 @@ func TestPruneRoundTrip(t *testing.T) {
 	if err := jsoniter.Unmarshal(b, loaded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	loaded.ensureDefaults()
+	loaded.allocOmittables()
 	validateOmittable(t, loaded)
 
 	loaded.rangeDefaultOmittable(func(sf *reflect.StructField, field reflect.Value) {
@@ -207,10 +211,304 @@ func TestPruneRoundTrip(t *testing.T) {
 	})
 }
 
+// An override may be merged into a freshly decoded sparse cluster config.
+// The section may be entirely absent or explicitly present but empty.
+// Hydrating first keeps a single-knob override from silently redefining the
+// rest of its section.
+func TestOverrideOntoSparseSections(t *testing.T) {
+	tests := []struct {
+		name string
+		c    *ClusterConfig
+	}{
+		{
+			name: "absent sections",
+			c:    &ClusterConfig{},
+		},
+		{
+			name: "present empty sections",
+			c: &ClusterConfig{
+				Disk: &DiskConf{},
+				EC:   &ECConf{},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := tt.c
+			if err := c.HydrateOmittables(); err != nil {
+				t.Fatalf("hydrate: %v", err)
+			}
+
+			// Startup and metasync-receive paths merge node overrides as
+			// apc.Daemon with IgnoreScope.
+			toUpdate := &ConfigToSet{
+				Disk: &DiskConfToSet{DiskUtilHighWM: apc.Ptr[int64](85)},
+				EC:   &ECConfToSet{DataSlices: apc.Ptr(4)},
+			}
+			if err := CopyProps(toUpdate, c, apc.Daemon, CopyPropsOpts{IgnoreScope: true}); err != nil {
+				t.Fatalf("copy daemon props: %v", err)
+			}
+			validateOmittable(t, c)
+
+			// Node-scoped override: merge onto hydrated defaults.
+			if c.Disk.DiskUtilHighWM != 85 {
+				t.Errorf("Disk.DiskUtilHighWM: got %d, expected 85",
+					c.Disk.DiskUtilHighWM)
+			}
+			if c.Disk.DiskUtilLowWM != diskUtilLowWMDflt ||
+				c.Disk.DiskUtilMaxWM != diskUtilMaxWMDflt {
+				t.Errorf("Disk watermarks: got (%d, %d, %d), expected (%d, 85, %d)",
+					c.Disk.DiskUtilLowWM, c.Disk.DiskUtilHighWM,
+					c.Disk.DiskUtilMaxWM, diskUtilLowWMDflt,
+					diskUtilMaxWMDflt)
+			}
+
+			// Cluster-scoped EC override from a node must be ignored.
+			if c.EC.DataSlices != ecDataSlicesDflt {
+				t.Errorf("EC.DataSlices: got %d, expected %d after ignored node override",
+					c.EC.DataSlices, ecDataSlicesDflt)
+			}
+			if c.EC.ObjSizeLimit != ecObjSizeLimitDflt {
+				t.Errorf("EC.ObjSizeLimit: got %d, expected %d",
+					c.EC.ObjSizeLimit, ecObjSizeLimitDflt)
+			}
+
+			// The same update at cluster scope must change DataSlices without
+			// reinterpreting zero ObjSizeLimit as "EC every object."
+			toUpdate = &ConfigToSet{
+				EC: &ECConfToSet{DataSlices: apc.Ptr(4)},
+			}
+			if err := CopyProps(toUpdate, c, apc.Cluster, CopyPropsOpts{}); err != nil {
+				t.Fatalf("copy cluster props: %v", err)
+			}
+			validateOmittable(t, c)
+
+			if c.EC.DataSlices != 4 {
+				t.Errorf("EC.DataSlices: got %d, expected 4", c.EC.DataSlices)
+			}
+			if c.EC.ObjSizeLimit != ecObjSizeLimitDflt {
+				t.Errorf("EC.ObjSizeLimit: got %d, expected inherited default %d",
+					c.EC.ObjSizeLimit, ecObjSizeLimitDflt)
+			}
+		})
+	}
+}
+
+// HydrateOmittables validates every omittable section, and Config.Validate
+// then does it again - so the section validators must be idempotent.
+// Note that ECConf.Validate keys off the section as a whole (`*c == ECConf{}`),
+// which makes this more than a formality.
+func TestOmittableValidateIdempotent(t *testing.T) {
+	c := &ClusterConfig{}
+	if err := c.HydrateOmittables(); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+
+	c.rangeDefaultOmittable(func(sf *reflect.StructField, field reflect.Value) {
+		first := reflect.New(field.Type().Elem())
+		first.Elem().Set(field.Elem())
+
+		o := field.Interface().(defaultOmittable)
+		if err := o.Validate(); err != nil {
+			t.Fatalf("%s: re-validate: %v", sf.Name, err)
+		}
+		if !reflect.DeepEqual(first.Elem().Interface(), field.Elem().Interface()) {
+			t.Errorf("%s: Validate() is not idempotent\n first: %+v\nsecond: %+v",
+				sf.Name, first.Elem().Interface(), field.Elem().Interface())
+		}
+	})
+}
+
+func TestHydratedOmittableDefaults(t *testing.T) {
+	c := &ClusterConfig{}
+	if err := c.HydrateOmittables(); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{
+			name: "GetBatch",
+			got:  c.GetBatch,
+			want: &GetBatchConf{
+				XactConf: XactConf{
+					Compression: apc.CompressNever,
+					SbundleMult: 2,
+					Burst:       512,
+				},
+				MaxWait:          cos.Duration(20 * time.Second),
+				NumWarmupWorkers: -1,
+				MaxSoftErrs:      8,
+				MaxGFN:           5,
+			},
+		},
+		{
+			name: "LRU",
+			got:  c.LRU,
+			want: &LRUConf{
+				DontEvictTime:   cos.Duration(2 * time.Hour),
+				CapacityUpdTime: cos.Duration(10 * time.Minute),
+				BatchSize:       32768,
+				Enabled:         false,
+			},
+		},
+		{
+			name: "FSHC",
+			got:  c.FSHC,
+			want: &FSHCConf{
+				TestFileCount: 4,
+				HardErrs:      2,
+				IOErrs:        10,
+				IOErrTime:     cos.Duration(10 * time.Second),
+				Enabled:       true,
+			},
+		},
+		{
+			name: "Keepalive",
+			got:  c.Keepalive,
+			want: &KeepaliveConf{
+				Proxy: KeepaliveTrackerConf{
+					Name:     "heartbeat",
+					Interval: cos.Duration(10 * time.Second),
+					Factor:   3,
+				},
+				Target: KeepaliveTrackerConf{
+					Name:     "heartbeat",
+					Interval: cos.Duration(10 * time.Second),
+					Factor:   3,
+				},
+				NumRetries:  3,
+				RetryFactor: 4,
+			},
+		},
+		{
+			name: "Rebalance",
+			got:  c.Rebalance,
+			want: &RebalanceConf{
+				XactConf: XactConf{
+					Compression: apc.CompressNever,
+					SbundleMult: 2,
+					Burst:       1024,
+				},
+				DestRetryTime: cos.Duration(2 * time.Minute),
+				Enabled:       true,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !reflect.DeepEqual(tt.got, tt.want) {
+				t.Fatalf("got %+v, expected %+v", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDefaultEnabledOmittablesPreserveDisable(t *testing.T) {
+	c := &ClusterConfig{}
+	if err := c.HydrateOmittables(); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+	c.FSHC.Enabled = false
+	c.Rebalance.Enabled = false
+
+	c.PruneOmittables()
+	if c.FSHC == nil || c.Rebalance == nil {
+		t.Fatalf("explicit disable pruned: fshc=%v rebalance=%v", c.FSHC, c.Rebalance)
+	}
+
+	b, err := jsoniter.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	loaded := &ClusterConfig{}
+	if err := jsoniter.Unmarshal(b, loaded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if err := loaded.HydrateOmittables(); err != nil {
+		t.Fatalf("rehydrate: %v", err)
+	}
+	if loaded.FSHC.Enabled || loaded.Rebalance.Enabled {
+		t.Fatalf("explicit disable lost: fshc=%t rebalance=%t",
+			loaded.FSHC.Enabled, loaded.Rebalance.Enabled)
+	}
+}
+
+func TestKeepaliveRetryFactorEffectiveRange(t *testing.T) {
+	c := &Config{}
+	if err := c.ClusterConfig.HydrateOmittables(); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+	c.Timeout.CplaneOperation = cos.Duration(2 * time.Second)
+	c.Timeout.MaxKeepalive = cos.Duration(5 * time.Second)
+
+	c.Keepalive.RetryFactor = 1
+	if got := KeepaliveRetryDuration(c); got != 2*time.Second {
+		t.Fatalf("retry_factor=1: got %v, expected 2s", got)
+	}
+	c.Keepalive.RetryFactor = 4
+	if got := KeepaliveRetryDuration(c); got != 6*time.Second {
+		t.Fatalf("retry_factor=4: got %v, expected capped 6s", got)
+	}
+}
+
+func TestGetBatchDefaultGFNRespectsSoftLimit(t *testing.T) {
+	c := &GetBatchConf{MaxSoftErrs: 3}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if c.MaxGFN != 3 {
+		t.Fatalf("max_gfn: got %d, expected 3", c.MaxGFN)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("second validate: %v", err)
+	}
+}
+
+// Defaults materialized in the inherited configuration remain inherited values
+// across a partial override. Explicitly resetting a derived field to zero asks
+// the final validation pass to derive it again.
+func TestOverridePreservesInheritedDerivedDefaults(t *testing.T) {
+	c := &ClusterConfig{}
+	if err := c.HydrateOmittables(); err != nil {
+		t.Fatalf("hydrate: %v", err)
+	}
+
+	inheritedSmooth := c.Disk.IostatTimeSmooth
+	if inheritedSmooth != cos.Duration(8*time.Second) {
+		t.Fatalf("default IostatTimeSmooth: got %v, expected 8s", inheritedSmooth)
+	}
+
+	// Override only the source field: the already inherited smooth interval
+	// remains unchanged.
+	c.Disk.IostatTimeLong = cos.Duration(4 * time.Second)
+	validateOmittable(t, c)
+
+	if c.Disk.IostatTimeSmooth != inheritedSmooth {
+		t.Errorf("IostatTimeSmooth: got %v, expected inherited value %v",
+			c.Disk.IostatTimeSmooth, inheritedSmooth)
+	}
+
+	// An explicit zero restores derived-default behavior.
+	c.Disk.IostatTimeSmooth = 0
+	validateOmittable(t, c)
+
+	const expected = 16 * time.Second
+	if c.Disk.IostatTimeSmooth.D() != expected {
+		t.Errorf("re-derived IostatTimeSmooth: got %v, expected %v",
+			c.Disk.IostatTimeSmooth, expected)
+	}
+}
+
 // The metasync path may prune the same representation repeatedly.
 func TestPruneIdempotent(t *testing.T) {
 	c := &ClusterConfig{}
-	c.ensureDefaults()
+	c.allocOmittables()
 	c.Lso.WalkBuffer = lsoWalkBufDflt * 2
 
 	c.PruneOmittables()

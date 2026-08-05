@@ -732,10 +732,49 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 		}
 	}
 
+	// 5. cross-section: keepalivetracker.*.interval vs timeout.max_keepalive
+	if toUpdate.Keepalive != nil || (toUpdate.Timeout != nil && toUpdate.Timeout.MaxKeepalive != nil) {
+		if err := _checkKalive(config, toUpdate); err != nil {
+			p.writeErr(w, r, err, http.StatusBadRequest)
+			return
+		}
+	}
+
 	// do
 	if _, err := p.owner.config.modify(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
+}
+
+// apply the (keepalivetracker.*.interval >= timeout.max_keepalive)
+// rule to the effective post-merge values
+func _checkKalive(config *cmn.Config, toUpdate *cmn.ConfigToSet) error {
+	kalive := *config.Keepalive
+	maxKeepalive := config.Timeout.MaxKeepalive
+
+	if toUpdate.Timeout != nil && toUpdate.Timeout.MaxKeepalive != nil {
+		maxKeepalive = *toUpdate.Timeout.MaxKeepalive
+	}
+	if ka := toUpdate.Keepalive; ka != nil {
+		if ka.Proxy != nil && ka.Proxy.Interval != nil {
+			kalive.Proxy.Interval = *ka.Proxy.Interval
+		}
+		if ka.Target != nil && ka.Target.Interval != nil {
+			kalive.Target.Interval = *ka.Target.Interval
+		}
+		if err := kalive.Validate(); err != nil {
+			return err
+		}
+	}
+	if kalive.Proxy.Interval < maxKeepalive {
+		return fmt.Errorf("keepalivetracker.proxy.interval=%s should be >= timeout.max_keepalive=%s",
+			kalive.Proxy.Interval, maxKeepalive)
+	}
+	if kalive.Target.Interval < maxKeepalive {
+		return fmt.Errorf("keepalivetracker.target.interval=%s should be >= timeout.max_keepalive=%s",
+			kalive.Target.Interval, maxKeepalive)
+	}
+	return nil
 }
 
 // switch http => https, or vice versa
@@ -789,6 +828,11 @@ func (p *proxy) rotateLogs(w http.ResponseWriter, r *http.Request, msg *apc.ActM
 }
 
 func (p *proxy) setCluCfgTransient(w http.ResponseWriter, r *http.Request, toUpdate *cmn.ConfigToSet, msg *apc.ActMsg) {
+	if err := _checkTransient(toUpdate); err != nil {
+		p.writeErr(w, r, err) // cmn.ErrUnsupp => 501
+		return
+	}
+
 	co := p.owner.config
 	co.Lock()
 	err := setConfig(toUpdate, true /* transient */)
@@ -809,6 +853,32 @@ func (p *proxy) setCluCfgTransient(w http.ResponseWriter, r *http.Request, toUpd
 	args.to = core.AllNodes
 	p.bcastAndRespond(w, r, args)
 	freeBcArgs(args)
+}
+
+// Transient (in-memory, not persisted) updates do not go through setCluCfgPersistent
+// and therefore bypass its pre-flight validations. Hence, the limitations that entail:
+// - everything in cmn.ConfigRestartRequired (transient updates to restart-required knobs are meaningless)
+// - `auth` (gated enable-time validation)
+// - `keepalivetracker` (cross-section rule vs timeout.max_keepalive)
+func _checkTransient(toUpdate *cmn.ConfigToSet) error {
+	const action = "transiently update"
+	switch {
+	case toUpdate.Auth != nil:
+		return cmn.NewErrUnsupp(action, "config.auth")
+	case toUpdate.Net != nil:
+		return cmn.NewErrUnsupp(action, "config.net")
+	case toUpdate.Tracing != nil:
+		return cmn.NewErrUnsupp(action, "config.tracing")
+	case toUpdate.Memsys != nil:
+		return cmn.NewErrUnsupp(action, "config.memsys")
+	case toUpdate.Keepalive != nil:
+		return cmn.NewErrUnsupp(action, "config.keepalivetracker")
+	case toUpdate.Timeout != nil && toUpdate.Timeout.MaxKeepalive != nil:
+		return cmn.NewErrUnsupp(action, "timeout.max_keepalive")
+	case toUpdate.Timeout != nil && toUpdate.Timeout.CplaneOperation != nil:
+		return cmn.NewErrUnsupp(action, "timeout.cplane_operation")
+	}
+	return nil
 }
 
 func _setConfPre(ctx *configModifier, clone *globalConfig) (updated bool, err error) {

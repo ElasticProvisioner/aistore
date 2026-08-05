@@ -7,7 +7,6 @@ package main
 import (
 	"time"
 
-	aisapc "github.com/NVIDIA/aistore/api/apc"
 	aiscmn "github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 )
@@ -15,35 +14,6 @@ import (
 var (
 	defaultAuth = aiscmn.AuthConf{
 		Enabled: false,
-	}
-
-	defaultCksum = aiscmn.CksumConf{
-		Type:            cos.ChecksumCesXxh,
-		ValidateColdGet: false,
-	}
-
-	defaultClientConf = aiscmn.ClientConf{
-		Timeout:        cos.Duration(10 * time.Second),
-		TimeoutLong:    cos.Duration(5 * time.Minute),
-		ListObjTimeout: cos.Duration(5 * time.Minute),
-	}
-
-	defaultTransport = aiscmn.TransportConf{
-		MaxHeaderSize:    4096,
-		Burst:            1024,
-		IdleTeardown:     cos.Duration(4 * time.Second),
-		QuiesceTime:      cos.Duration(10 * time.Second),
-		LZ4BlockMaxSize:  cos.SizeIEC(256 * cos.KiB),
-		LZ4FrameChecksum: false,
-	}
-
-	defaultDisk = aiscmn.DiskConf{
-		DiskUtilLowWM:    20,
-		DiskUtilHighWM:   80,
-		DiskUtilMaxWM:    95,
-		IostatTimeLong:   cos.Duration(2 * time.Second),
-		IostatTimeShort:  cos.Duration(100 * time.Millisecond),
-		IostatTimeSmooth: cos.Duration(8 * time.Second),
 	}
 
 	defaultNet = aiscmn.NetConf{
@@ -61,78 +31,11 @@ var (
 		},
 	}
 
-	defaultFSHC = aiscmn.FSHCConf{
-		TestFileCount: 4,
-		HardErrs:      2,
-		IOErrs:        10,
-		IOErrTime:     cos.Duration(10 * time.Second),
-		Enabled:       true,
-	}
-
-	defaultDownloader = aiscmn.DownloaderConf{
-		Timeout: cos.Duration(time.Hour),
-	}
-
-	defaultKeepalive = aiscmn.KeepaliveConf{
-		Proxy: aiscmn.KeepaliveTrackerConf{
-			Interval: cos.Duration(10 * time.Second),
-			Name:     "heartbeat",
-			Factor:   3,
-		},
-		Target: aiscmn.KeepaliveTrackerConf{
-			Interval: cos.Duration(10 * time.Second),
-			Name:     "heartbeat",
-			Factor:   3,
-		},
-		RetryFactor: 4,
-		NumRetries:  3,
-	}
-
-	defaultLog = aiscmn.LogConf{
-		Level:     "3",
-		MaxSize:   cos.SizeIEC(64 * cos.MiB),
-		MaxTotal:  cos.SizeIEC(512 * cos.MiB),
-		FlushTime: cos.Duration(time.Minute),
-		StatsTime: cos.Duration(3 * time.Minute),
-	}
-
-	defaultSpace = aiscmn.SpaceConf{
-		CleanupWM:       65,
-		LowWM:           75,
-		HighWM:          90,
-		OOS:             95,
-		BatchSize:       32768,
-		DontCleanupTime: cos.Duration(60 * time.Minute),
-	}
-
 	defaultMemsys = aiscmn.MemsysConf{
 		MinFree:        cos.SizeIEC(6 * cos.GiB),
 		DefaultBufSize: cos.SizeIEC(64 * cos.KiB),
 		SizeToGC:       cos.SizeIEC(6 * cos.GiB),
 		HousekeepTime:  cos.Duration(120 * time.Second),
-	}
-
-	defaultLRU = aiscmn.LRUConf{
-		Enabled:         false,
-		DontEvictTime:   cos.Duration(120 * time.Minute),
-		CapacityUpdTime: cos.Duration(10 * time.Minute),
-		BatchSize:       32768,
-	}
-
-	defaultPeriodic = aiscmn.PeriodConf{
-		StatsTime:     cos.Duration(10 * time.Second),
-		NotifTime:     cos.Duration(30 * time.Second),
-		RetrySyncTime: cos.Duration(2 * time.Second),
-	}
-
-	defaultRebalance = aiscmn.RebalanceConf{
-		XactConf: aiscmn.XactConf{
-			Compression: aisapc.CompressNever,
-			SbundleMult: 2,
-			Burst:       2048,
-		},
-		Enabled:       true,
-		DestRetryTime: cos.Duration(2 * time.Minute),
 	}
 
 	defaultResilver = aiscmn.ResilverConf{
@@ -154,53 +57,15 @@ var (
 		Enabled:         true,
 		ValidateWarmGet: false,
 	}
-
-	defaultWritePolicy = aiscmn.WritePolicyConf{
-		Data: "",
-		MD:   "",
-	}
-
-	defaultRateLimit = aiscmn.RateLimitConf{
-		Backend: aiscmn.Adaptive{
-			RateLimitBase: aiscmn.RateLimitBase{
-				Interval:  cos.Duration(time.Minute),
-				MaxTokens: 1000,
-				Enabled:   false,
-			},
-			NumRetries: 3,
-		},
-		Frontend: aiscmn.Bursty{
-			RateLimitBase: aiscmn.RateLimitBase{
-				Interval:  cos.Duration(time.Minute),
-				MaxTokens: 1000,
-				Enabled:   false,
-			},
-			Size: 375,
-		},
-	}
 )
 
 func newDefaultConfig() *aiscmn.ClusterConfig {
 	return &aiscmn.ClusterConfig{
-		Auth:        defaultAuth,
-		Cksum:       defaultCksum,
-		Client:      defaultClientConf,
-		Transport:   defaultTransport,
-		Disk:        defaultDisk,
-		Net:         defaultNet,
-		FSHC:        defaultFSHC,
-		Downloader:  defaultDownloader,
-		Keepalive:   defaultKeepalive,
-		Log:         defaultLog,
-		Space:       defaultSpace,
-		Memsys:      defaultMemsys,
-		LRU:         defaultLRU,
-		Periodic:    defaultPeriodic,
-		Rebalance:   defaultRebalance,
-		Resilver:    defaultResilver,
-		Timeout:     defaultTimeout,
-		Versioning:  defaultVersioning,
-		WritePolicy: defaultWritePolicy,
-		RateLimit:   defaultRateLimit,
+		Auth:       defaultAuth,
+		Net:        defaultNet,
+		Memsys:     defaultMemsys,
+		Resilver:   defaultResilver,
+		Timeout:    defaultTimeout,
+		Versioning: defaultVersioning,
 	}
 }

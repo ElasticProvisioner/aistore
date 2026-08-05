@@ -24,6 +24,7 @@ import (
 	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/atomic"
 	"github.com/NVIDIA/aistore/cmn/cos"
+	"github.com/NVIDIA/aistore/cmn/jsp"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/core/mock"
 	"github.com/NVIDIA/aistore/memsys"
@@ -687,7 +688,7 @@ func TestMetasyncData(t *testing.T) {
 	bmd = bmd.clone()
 	bprops := &cmn.Bprops{
 		Cksum: cmn.CksumConf{Type: cos.ChecksumOneXxh},
-		LRU:   cmn.GCO.Get().LRU,
+		LRU:   *cmn.GCO.Get().LRU,
 	}
 	bmd.add(meta.NewBck("bucket3", apc.AIS, cmn.NsGlobal), bprops)
 	primary.owner.bmd.putPersist(bmd, nil)
@@ -914,4 +915,75 @@ func (m msgSortHelper) Less(i, j int) bool {
 	}
 
 	return m[i].cnt < m[j].cnt
+}
+
+func TestExtractConfigHydratesSparse(t *testing.T) {
+	current := cmn.GCO.Get()
+
+	src := &globalConfig{}
+	src.Version = current.Version + 1
+	src.UUID = current.UUID
+	tassert.CheckFatal(t, src.ClusterConfig.HydrateOmittables())
+
+	sgl := src._encode(0)
+	defer sgl.Free()
+
+	// Verify that _encode actually produced the representation that caused the
+	// regression: default-omittable sections are absent on the wire.
+	var sparse globalConfig
+	_, err := jsp.Decode(bytes.NewReader(sgl.Bytes()), &sparse, sparse.JspOpts(), "sparse config test")
+	tassert.CheckFatal(t, err)
+
+	tassert.Fatalf(t,
+		sparse.Log == nil &&
+			sparse.Client == nil &&
+			sparse.Space == nil &&
+			sparse.Transport == nil &&
+			sparse.GetBatch == nil &&
+			sparse.LRU == nil &&
+			sparse.FSHC == nil &&
+			sparse.Keepalive == nil &&
+			sparse.Rebalance == nil,
+		"expected sparse config, got log=%v client=%v space=%v transport=%v get-batch=%v lru=%v fshc=%v keepalive=%v rebalance=%v",
+		sparse.Log, sparse.Client, sparse.Space, sparse.Transport, sparse.GetBatch,
+		sparse.LRU, sparse.FSHC, sparse.Keepalive, sparse.Rebalance)
+
+	// Exercise the real metasync receive boundary, not HydrateOmittables directly.
+	payload := msPayload{revsConfTag: sgl.Bytes()}
+	got, _, err := (&htrun{}).extractConfig(payload, "test")
+	tassert.CheckFatal(t, err)
+	tassert.Fatalf(t, got != nil, "extractConfig returned nil config")
+
+	tassert.Fatalf(t,
+		got.Log != nil &&
+			got.Client != nil &&
+			got.Space != nil &&
+			got.Transport != nil &&
+			got.GetBatch != nil &&
+			got.LRU != nil &&
+			got.FSHC != nil &&
+			got.Keepalive != nil &&
+			got.Rebalance != nil,
+		"decoded config not hydrated: log=%v client=%v space=%v transport=%v get-batch=%v lru=%v fshc=%v keepalive=%v rebalance=%v",
+		got.Log, got.Client, got.Space, got.Transport, got.GetBatch,
+		got.LRU, got.FSHC, got.Keepalive, got.Rebalance)
+
+	tassert.Fatalf(t, reflect.DeepEqual(got.Log, src.Log),
+		"log mismatch: got %+v, expected %+v", got.Log, src.Log)
+	tassert.Fatalf(t, reflect.DeepEqual(got.Client, src.Client),
+		"client mismatch: got %+v, expected %+v", got.Client, src.Client)
+	tassert.Fatalf(t, reflect.DeepEqual(got.Space, src.Space),
+		"space mismatch: got %+v, expected %+v", got.Space, src.Space)
+	tassert.Fatalf(t, reflect.DeepEqual(got.Transport, src.Transport),
+		"transport mismatch: got %+v, expected %+v", got.Transport, src.Transport)
+	tassert.Fatalf(t, reflect.DeepEqual(got.GetBatch, src.GetBatch),
+		"get-batch mismatch: got %+v, expected %+v", got.GetBatch, src.GetBatch)
+	tassert.Fatalf(t, reflect.DeepEqual(got.LRU, src.LRU),
+		"lru mismatch: got %+v, expected %+v", got.LRU, src.LRU)
+	tassert.Fatalf(t, reflect.DeepEqual(got.FSHC, src.FSHC),
+		"fshc mismatch: got %+v, expected %+v", got.FSHC, src.FSHC)
+	tassert.Fatalf(t, reflect.DeepEqual(got.Keepalive, src.Keepalive),
+		"keepalive mismatch: got %+v, expected %+v", got.Keepalive, src.Keepalive)
+	tassert.Fatalf(t, reflect.DeepEqual(got.Rebalance, src.Rebalance),
+		"rebalance mismatch: got %+v, expected %+v", got.Rebalance, src.Rebalance)
 }
