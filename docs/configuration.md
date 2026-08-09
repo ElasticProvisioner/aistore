@@ -262,7 +262,7 @@ Practical consequences:
 - **Never read `.ais.conf` to find out what a setting is.** Use the CLI or the API. It is protected metadata rather than plain JSON, and it is an internal representation.
 - **Defaults can change between AIStore releases.** Either way, check the release notes and set the desired value again if it differs from the new default. A value equal to the current canonical default cannot be pinned by explicitly setting it; it may be pruned again.
 
-The sections AIStore can reconstruct this way, as of v5.0:
+The sections AIStore can reconstruct this way, as of v5.0 (22 in total; the same set is listed again under [Default-enabled sections](#default-enabled-sections), where `expectedOmittable` in `cmn/prune_defaults_internal_test.go` is the authoritative source):
 
 ```text
 arch          chunks        client        checksum      disk
@@ -649,6 +649,11 @@ Once a section is fully default-hydrated:
 
 The goal is one owner per default, not a minimal initial file at the cost of deployment intent.
 
+**NOTE:**
+
+> For Kubernetes deployments, always deploy `aisinit` and `aisnode` from the same AIStore release/image tag. See related:
+> [Kubernetes bootstrap configuration and default ownership (`aisinit`)](https://github.com/NVIDIA/aistore/blob/main/cmd/aisinit/README.md)
+
 ### Compatibility and test checklist
 
 Sparse persistence changes what older binaries receive. Before adding an omittable section, determine how every release in the supported upgrade window treats its absence. An older validator may hydrate the same values, hydrate different values, accept zeros and run with unintended behavior, or refuse to start.
@@ -676,6 +681,7 @@ Coverage for any configuration change should include:
 
 ## Related documentation
 
+- [Kubernetes bootstrap configuration and default ownership (`aisinit`)](https://github.com/NVIDIA/aistore/blob/main/cmd/aisinit/README.md)
 - [CLI: configuration](/docs/cli/config.md)
 - [AIStore HTTP API](/docs/http_api.md)
 - [AIStore Networking Model](/docs/networking.md)

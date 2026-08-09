@@ -34,9 +34,40 @@ const getCluLogsUsage = "Download log archives from all clustered nodes (one TAR
 	indent1 + "see related:\n" +
 	indent1 + "\t - 'ais log get --help'"
 
-const shutdownUsage = "Shutdown a node, gracefully or immediately.\n" +
+const membershipUsage = "Manage cluster membership: add nodes, remove them temporarily or permanently.\n" +
+	indent1 + "All lifecycle subcommands, with the single exception of 'join', accept 'NODE_ID [NODE_ID...]' - a batch of nodes,\n" +
+	indent1 + "comma- or space-separated - and execute it as one coordinated operation.\n" +
+	indent1 + "When required, the cluster runs one global rebalance for the whole batch."
+
+const startMaintUsage = "Put one or more nodes in maintenance mode, temporarily suspending their operation.\n" +
+	indent1 + "Nodes in maintenance remain in the cluster map; use 'stop-maintenance' to reactivate.\n" +
+	indent1 + "\te.g.:\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStartMaint + " t[QrmZvKdN]'\t- single target;\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStartMaint + " t[QrmZvKdN] t[HbjTwLpS]'\t- two targets, one rebalance for the batch;\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStartMaint + " QrmZvKdN,HbjTwLpS'\t- same, comma-separated;\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStartMaint + " <TAB-TAB>'\t- tab-complete remaining (not yet selected) nodes.\n" +
+	indent1 + "Note: the request is rejected while global rebalance is running; see 'ais show rebalance'."
+
+const stopMaintUsage = "Take one or more nodes out of maintenance mode - activate.\n" +
+	indent1 + "Runs at most one global rebalance for the entire batch.\n" +
+	indent1 + "\te.g.:\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStopMaint + " t[QrmZvKdN] t[HbjTwLpS]'\t- reactivate both, one rebalance;\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdStopMaint + " <TAB-TAB>'\t- tab-complete remaining nodes currently in maintenance.\n" +
+	indent1 + "Note: if a node was shut down, restart it first and let it re-register with the primary."
+
+const decommissionNodeUsage = "Safely and permanently remove one or more nodes from the cluster.\n" +
+	indent1 + "The operation cannot be undone: a decommissioned node must be re-joined or redeployed.\n" +
+	indent1 + "\te.g.:\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdNodeDecommission + " t[QrmZvKdN] t[HbjTwLpS]'\t- both, one rebalance for the batch;\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdNodeDecommission + " QrmZvKdN,HbjTwLpS --rm-user-data --yes'\t- same, also remove user data.\n" +
+	indent1 + "Note: the request is rejected while global rebalance is running; see 'ais show rebalance'."
+
+const shutdownUsage = "Shutdown one or more nodes, gracefully or immediately.\n" +
 	indent1 + "\tNote: upon shutdown, the node won't be decommissioned - it'll remain in the cluster map\n" +
 	indent1 + "\tand can be manually restarted to rejoin the cluster at any later time;\n" +
+	indent1 + "\tAccepts a batch: 'NODE_ID [NODE_ID...]', comma- or space-separated - one rebalance for all.\n" +
+	indent1 + "\te.g.:\n" +
+	indent1 + "\t- 'ais cluster " + cmdMembership + " " + cmdShutdown + " t[QrmZvKdN] t[HbjTwLpS] --yes'\t- shut down both with one rebalance;\n" +
 	indent1 + "\tsee also: 'ais advanced " + cmdRmSmap + "'"
 
 const setPrimaryUsage = "Select a new primary proxy/gateway.\n" +
@@ -197,7 +228,7 @@ var (
 			// node level
 			{
 				Name:  cmdMembership,
-				Usage: "Manage cluster membership (add/remove nodes, temporarily or permanently)",
+				Usage: membershipUsage,
 				Subcommands: []cli.Command{
 					{
 						Name:      cmdJoin,
@@ -208,35 +239,35 @@ var (
 					},
 					{
 						Name:         cmdStartMaint,
-						Usage:        "Put node in maintenance mode, temporarily suspend its operation",
-						ArgsUsage:    nodeIDArgument,
+						Usage:        startMaintUsage,
+						ArgsUsage:    nodeIDsArgument,
 						Flags:        sortFlags(clusterCmdsFlags[cmdStartMaint]),
 						Action:       nodeMaintShutDecommHandler,
-						BashComplete: suggestAllNodes,
+						BashComplete: suggestAllNodesMulti,
 					},
 					{
 						Name:         cmdStopMaint,
-						Usage:        "Take node out of maintenance mode - activate",
-						ArgsUsage:    nodeIDArgument,
+						Usage:        stopMaintUsage,
+						ArgsUsage:    nodeIDsArgument,
 						Flags:        sortFlags(clusterCmdsFlags[cmdStopMaint]),
 						Action:       nodeMaintShutDecommHandler,
 						BashComplete: suggestNodesInMaint,
 					},
 					{
 						Name:         cmdNodeDecommission,
-						Usage:        "Safely and permanently remove node from the cluster",
-						ArgsUsage:    nodeIDArgument,
+						Usage:        decommissionNodeUsage,
+						ArgsUsage:    nodeIDsArgument,
 						Flags:        sortFlags(clusterCmdsFlags[cmdNodeDecommission+".node"]),
 						Action:       nodeMaintShutDecommHandler,
-						BashComplete: suggestAllNodes,
+						BashComplete: suggestAllNodesMulti,
 					},
 					{
 						Name:         cmdShutdown,
 						Usage:        shutdownUsage,
-						ArgsUsage:    nodeIDArgument,
+						ArgsUsage:    nodeIDsArgument,
 						Flags:        sortFlags(clusterCmdsFlags[cmdShutdown+".node"]),
 						Action:       nodeMaintShutDecommHandler,
-						BashComplete: suggestAllNodes,
+						BashComplete: suggestAllNodesMulti,
 					},
 				},
 			},
@@ -438,27 +469,60 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	node, sname, err := getNode(c, c.Args().Get(0))
-	if err != nil {
-		return err
-	}
 	action := c.Command.Name
-	if smap.IsPrimary(node) {
-		return fmt.Errorf("%s is primary (cannot %s the primary node)", sname, action)
+	var (
+		nodeArgs  = make([]string, 0, c.NArg())
+		hasTarget bool
+	)
+	for _, arg := range c.Args() {
+		for _, nodeArg := range splitCsv(arg) {
+			if nodeArg != "" {
+				nodeArgs = append(nodeArgs, nodeArg)
+			}
+		}
+	}
+	if len(nodeArgs) == 0 {
+		return missingArgumentsError(c, c.Command.ArgsUsage)
+	}
+	var (
+		snames    = make([]string, 0, len(nodeArgs))
+		daemonIDs = make([]string, 0, len(nodeArgs))
+		seen      = make(map[string]struct{}, len(nodeArgs))
+	)
+	for _, nodeArg := range nodeArgs {
+		node, sname, err := getNode(c, nodeArg)
+		if err != nil {
+			return err
+		}
+		if smap.IsPrimary(node) {
+			return fmt.Errorf("%s is primary (cannot %s the primary node)", sname, action)
+		}
+		if _, ok := seen[node.ID()]; ok {
+			return fmt.Errorf("%s is specified more than once", sname)
+		}
+		seen[node.ID()] = struct{}{}
+		snames = append(snames, sname)
+		daemonIDs = append(daemonIDs, node.ID())
+		hasTarget = hasTarget || node.IsTarget()
 	}
 	var (
 		xid               string
-		skipRebalance     = flagIsSet(c, noRebalanceFlag) || node.IsProxy()
+		sname             = strings.Join(snames, ", ")
+		skipRebalance     = flagIsSet(c, noRebalanceFlag) || !hasTarget
 		noShutdown        = flagIsSet(c, noShutdownFlag)
 		rmUserData        = flagIsSet(c, rmUserDataFlag)
 		keepInitialConfig = flagIsSet(c, keepInitialConfigFlag)
 		actValue          = &apc.ActValRmNode{
-			DaemonID:      node.ID(),
 			SkipRebalance: skipRebalance,
 			NoShutdown:    noShutdown,
 		}
 	)
-	if skipRebalance && node.IsTarget() {
+	if len(daemonIDs) == 1 {
+		actValue.DaemonID = daemonIDs[0]
+	} else {
+		actValue.DaemonIDs = daemonIDs
+	}
+	if skipRebalance && hasTarget {
 		warn := fmt.Sprintf("executing %q _and_ not running global rebalance may lead to a loss of data!", action)
 		actionWarn(c, warn)
 		fmt.Fprintln(c.App.Writer,
@@ -517,27 +581,29 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	if xid != "" {
 		fmt.Fprintf(c.App.Writer, fmtRebalanceStarted, xid)
 	}
-	switch action {
-	case cmdStopMaint:
-		fmt.Fprintf(c.App.Writer, "%s is now active\n", sname)
-	case cmdNodeDecommission:
-		if skipRebalance || node.IsProxy() {
-			fmt.Fprintf(c.App.Writer, "%s has been decommissioned (permanently removed from the cluster)\n", sname)
-		} else {
-			fmt.Fprintf(c.App.Writer,
-				"%s is being decommissioned, please wait for cluster rebalancing to finish...\n", sname)
+	for _, sname := range snames {
+		switch action {
+		case cmdStopMaint:
+			fmt.Fprintf(c.App.Writer, "%s is now active\n", sname)
+		case cmdNodeDecommission:
+			if skipRebalance {
+				fmt.Fprintf(c.App.Writer, "%s has been decommissioned (permanently removed from the cluster)\n", sname)
+			} else {
+				fmt.Fprintf(c.App.Writer,
+					"%s is being decommissioned, please wait for cluster rebalancing to finish...\n", sname)
+			}
+		case cmdShutdown:
+			if skipRebalance {
+				fmt.Fprintf(c.App.Writer, "%s has been shut down\n", sname)
+			} else {
+				fmt.Fprintf(c.App.Writer,
+					"%s is shutting down, please wait for cluster rebalancing to finish\n", sname)
+			}
+			fmt.Fprintf(c.App.Writer, "\nNote: the node %s is _not_ decommissioned - it remains in the cluster map and can be manually\n", sname)
+			fmt.Fprintf(c.App.Writer, "restarted at any later time (and subsequently activated via '%s' operation).\n", cmdStopMaint)
+		case cmdStartMaint:
+			fmt.Fprintf(c.App.Writer, "%s is now in maintenance mode\n", sname)
 		}
-	case cmdShutdown:
-		if skipRebalance || node.IsProxy() {
-			fmt.Fprintf(c.App.Writer, "%s has been shut down\n", sname)
-		} else {
-			fmt.Fprintf(c.App.Writer,
-				"%s is shutting down, please wait for cluster rebalancing to finish\n", sname)
-		}
-		fmt.Fprintf(c.App.Writer, "\nNote: the node %s is _not_ decommissioned - it remains in the cluster map and can be manually\n", sname)
-		fmt.Fprintf(c.App.Writer, "restarted at any later time (and subsequently activated via '%s' operation).\n", cmdStopMaint)
-	case cmdStartMaint:
-		fmt.Fprintf(c.App.Writer, "%s is now in maintenance mode\n", sname)
 	}
 	return nil
 }

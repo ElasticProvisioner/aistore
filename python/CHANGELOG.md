@@ -33,6 +33,8 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 - **BREAKING**: AuthN cluster registration now verifies AIStore TLS
   certificates by default. Deployments using untrusted certificates must
   configure `ca_cert` or explicitly set `skip_verify=True`.
+- **BREAKING**: `ACCESS_RW` no longer includes `PROMOTE`. Promote now additionally
+  requires `ADMIN`; grant `PROMOTE | ADMIN` (or `ACCESS_SU`).
 - ETL pod spec templates no longer list the obsolete `io://` communication type.
 - Deprecated `Etl.init_spec()` with a `FutureWarning`; use `Etl.init()` or
   `Etl.init_class()` instead. Pod spec initialization will be removed in v5.1.
@@ -64,6 +66,9 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 - ETL webservers now forward
   `etl_args` to the next stage on direct-put pipeline hops. Previously only the
   first pipeline stage received `etl_args`; stages 2..N saw an empty value.
+- Fixed multiple correctness bugs in the streaming multipart decoder:
+  - Infinite spin when boundary or header terminator was absent at EOF and corrupted/truncated headers when header and body bytes arrived in the same chunk or near the buffer size limit.
+  - Body content misidentified as headers, stray newline prepended to headers on subsequent parts, epilogue bytes appended to the last part's body, and body bytes dropped under mixed line endings.
 
 ## [1.25.0] - 2026-05-20
 

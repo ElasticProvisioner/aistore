@@ -1,3 +1,5 @@
+//go:build etl
+
 // Package ais provides AIStore's proxy and target nodes.
 /*
  * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
@@ -22,6 +24,38 @@ import (
 	"github.com/NVIDIA/aistore/xact"
 )
 
+// EtlMD mutations are proxy-only. Keep their context and helpers with the ETL
+// proxy handlers so the upcoming `etl` build tag excludes the entire path.
+type etlMDModifier struct {
+	msg etl.InitMsg // interface
+
+	pre   func(ctx *etlMDModifier, clone *etlMD) (err error)
+	final func(ctx *etlMDModifier, clone *etlMD)
+
+	podMap  etl.PodMap
+	etlName string
+	stage   etl.Stage
+	wait    bool
+}
+
+func (p *proxy) preModifyEtlMD(ctx *etlMDModifier) (clone *etlMD, err error) {
+	eo := p.owner.etl
+	eo.Lock()
+	defer eo.Unlock()
+	clone = eo.get().clone()
+	if err = ctx.pre(ctx, clone); err == nil {
+		err = eo.putPersist(clone, nil)
+	}
+	return
+}
+
+func (p *proxy) modifyEtlMD(ctx *etlMDModifier) (clone *etlMD, err error) {
+	if clone, err = p.preModifyEtlMD(ctx); err == nil && ctx.final != nil {
+		ctx.final(ctx, clone)
+	}
+	return
+}
+
 // [METHOD] /v1/etl
 // ETL handler router - dispatches to specific HTTP method handlers
 func (p *proxy) etlHandler(w http.ResponseWriter, r *http.Request) {
@@ -30,24 +64,24 @@ func (p *proxy) etlHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch r.Method {
+	case http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut:
+	default:
+		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost, http.MethodPut)
+		return
+	}
+	// require Admin access (a no-op if AuthN is not used)
+	if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
+		return
+	}
+	switch r.Method {
 	case http.MethodPut:
-		// require Admin access (a no-op if AuthN is not used, here and elsewhere)
-		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
-			return
-		}
 		p.httpetlput(w, r)
 	case http.MethodPost:
 		p.httpetlpost(w, r)
 	case http.MethodGet:
 		p.httpetlget(w, r)
 	case http.MethodDelete:
-		// ditto
-		if err := p.checkAccess(w, r, nil, apc.AceAdmin); err != nil {
-			return
-		}
 		p.httpetldel(w, r)
-	default:
-		cmn.WriteErr405(w, r, http.MethodDelete, http.MethodGet, http.MethodPost)
 	}
 }
 
@@ -211,7 +245,7 @@ func (p *proxy) httpetldel(w http.ResponseWriter, r *http.Request) {
 		etlName: etlName,
 		wait:    true,
 	}
-	if _, err := p.owner.etl.modify(ctx); err != nil {
+	if _, err := p.modifyEtlMD(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
 }
@@ -233,7 +267,7 @@ func (p *proxy) startETL(w http.ResponseWriter, r *http.Request, msg etl.InitMsg
 		stage: etl.Initializing,
 		wait:  true,
 	}
-	if _, err := p.owner.etl.modify(ctx); err != nil {
+	if _, err := p.modifyEtlMD(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
 
@@ -245,7 +279,9 @@ func (p *proxy) startETL(w http.ResponseWriter, r *http.Request, msg etl.InitMsg
 	rxid, podMap, err := p.etlInitTxn(msg, xid, secret)
 	if err != nil { // if transaction fails, put etlMD to Aborted stage
 		ctx.stage = etl.Aborted
-		p.owner.etl.modify(ctx)
+		if _, errMD := p.modifyEtlMD(ctx); errMD != nil {
+			nlog.Errorf("failed to update etlMD for %s after init failure: %v", msg.Name(), errMD)
+		}
 		p.writeErr(w, r, err)
 		return
 	}
@@ -253,7 +289,7 @@ func (p *proxy) startETL(w http.ResponseWriter, r *http.Request, msg etl.InitMsg
 	// 3. update etlMD to Running stage
 	ctx.stage = etl.Running
 	ctx.podMap = podMap
-	if _, err := p.owner.etl.modify(ctx); err != nil {
+	if _, err := p.modifyEtlMD(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
 
@@ -499,7 +535,7 @@ func (p *proxy) stopETL(w http.ResponseWriter, r *http.Request, msg etl.InitMsg)
 		stage: etl.Aborted,
 		wait:  true,
 	}
-	if _, err := p.owner.etl.modify(ctx); err != nil {
+	if _, err := p.modifyEtlMD(ctx); err != nil {
 		p.writeErr(w, r, err)
 	}
 }
@@ -551,8 +587,78 @@ func (ef *_etlFinalizer) cb(nl nl.Listener) {
 		stage: etl.Aborted,
 		wait:  true,
 	}
-	_, err := ef.p.owner.etl.modify(ctx)
+	_, err := ef.p.modifyEtlMD(ctx)
 	if err != nil {
 		nlog.Errorf("failed to update etlMD for %s: %v", ef.msg.Name(), err)
 	}
+}
+
+//
+// ETL
+// initialize ETL pods on the nodes and connect them with of all participant targets
+// etlMD and stages won't be updated in this call (caller's responsibility)
+//
+
+func (p *proxy) etlInitTxn(initMsg etl.InitMsg, xid, secret string) (string, etl.PodMap, error) {
+	// 1. initialize transaction client
+	c := &txnCln{p: p}
+	actMsg := &apc.ActMsg{Action: apc.ActETLInline, Value: initMsg, Name: secret}
+	c.init(actMsg, nil /*bucket*/, xid, false /*waitmsync*/)
+
+	// 2. begin - broadcast initMsg, xid, secret to targets and wait for all pods to be ready
+	// Pre-stamp QparamNotifyMe before begin so the Begin2PC request carries it to every target.
+	// Targets read this param in addNotif() to register their xact notifier — required for
+	// runtime pod failure propagation. The IC listener itself is registered only in step 3.
+	c.req.Query.Set(apc.QparamNotifyMe, equalIC)
+	podMap, err := etlTxnBegin(c, initMsg)
+	if err != nil {
+		c.bcastAbort(initMsg, err)
+		return "", nil, err
+	}
+
+	// 3. IC
+	smap := p.owner.smap.get()
+	nl := xact.NewXactNL(c.uuid, apc.ActETLInline, &smap.Smap, nil)
+	ef := &_etlFinalizer{p, initMsg} // TODO: add pod watcher to etlFinilazer
+	nl.F = ef.cb
+
+	nl.SetOwner(equalIC)
+	p.ic.registerEqual(regIC{nl: nl, smap: smap, query: c.req.Query})
+
+	// 4. commit
+	rxid, _, errV := c.commit(initMsg, c.cmtTout(false))
+	debug.Assertf(rxid == xid, "committed %q vs proposed %q", rxid, xid)
+	if errV != nil {
+		c.bcastAbort(initMsg, errV)
+		return "", nil, errV
+	}
+
+	return rxid, podMap, err
+}
+
+// begin phase customized to collect pod info from nodes
+func etlTxnBegin(c *txnCln, initMsg etl.InitMsg) (podMap etl.PodMap, err error) {
+	// Broadcast initMsg with init timeout + network timeout
+	// (wait for initialization error propagation from target)
+	initTimeout, _ := initMsg.Timeouts()
+	// TODO: currently, ETL init requests are broadcasted to at most `MaxParallelism()` targets concurrently (see `htrun.bcastNodes()`)
+	// therefore, targets beyond that concurrency limit will block until the previous batch of targets completes.
+	// could be optimized by issuing more than `MaxParallelism()` requests at once in a single broadcast.
+	results := c.bcast(apc.Begin2PC, initTimeout.D()+c.timeout.netw)
+	podMap = make(etl.PodMap, len(results))
+	for _, res := range results {
+		podInfo := etl.PodInfo{}
+		if res.err != nil {
+			err = res.toErr()
+			break
+		}
+		debug.Assert(c.uuid == res.header.Get(apc.HdrXactionID), "expected xid", c.uuid, "got", res.header.Get(apc.HdrXactionID))
+		cos.MustMarshalFromString(res.header.Get(apc.HdrETLPodInfo), &podInfo)
+		podMap[res.si.ID()] = podInfo
+	}
+	freeBcastRes(results)
+	if err != nil {
+		return nil, err
+	}
+	return podMap, nil
 }
