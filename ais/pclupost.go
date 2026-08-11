@@ -74,6 +74,7 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) 
 		p.writeErrURL(w, r)
 		return
 	}
+
 	if p.settingNewPrimary.Load() {
 		// ignore or fail
 		if apiOp != apc.Keepalive {
@@ -127,13 +128,15 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) 
 		return
 	}
 	if c.apiOp == apc.SelfJoin && (!p.ClusterStarted() || added) {
+		primary := p.primary()
 		if !added {
 			// motivation: preserve peer metadata even when it is already in local Smap
 			nlog.Warningln(p.String(), "adding", c.nsi.StringEx(), "to startup reg.pool without local Smap add", c.smap.StringEx())
 		}
-		p.reg.mpl.Lock()
-		p.reg.pool = append(p.reg.pool, c.regReq)
-		p.reg.mpl.Unlock()
+
+		primary.reg.mpl.Lock()
+		primary.reg.pool = append(primary.reg.pool, c.regReq)
+		primary.reg.mpl.Unlock()
 	}
 
 	c.dispatch(msync)
@@ -141,7 +144,10 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) 
 
 // respond to fastKalive from nodes
 func (p *proxy) fastKaliveRsp(w http.ResponseWriter, r *http.Request, smap *smapX, config *cmn.Config, sid string) {
-	fast := p.readyToFastKalive.Load()
+	var (
+		primary = p.primary()
+		fast    = primary.fastKalive.Load()
+	)
 	if !fast {
 		var (
 			now       = mono.NanoTime()
@@ -149,7 +155,7 @@ func (p *proxy) fastKaliveRsp(w http.ResponseWriter, r *http.Request, smap *smap
 			minUptime = max(cfg.Target.Interval.D(), cfg.Proxy.Interval.D()) << 1
 		)
 		if fast = p.keepalive.cluUptime(now) > minUptime; fast {
-			p.readyToFastKalive.Store(true) // not resetting upon a change of primary
+			primary.fastKalive.Store(true) // not resetting upon a change of primary
 		}
 	}
 	if fast {
@@ -295,6 +301,10 @@ func (c *clupost) validate() (stop bool) {
 
 	// node flags
 	if osi := c.smap.GetNode(nsi.ID()); osi != nil {
+		if nsi.Flags != osi.Flags {
+			nlog.Warningln(p.String(), nsi.StringEx(), "reported flags", nsi.Fl2S(),
+				"vs", osi.Fl2S(), "in", c.smap.String(), "- overriding")
+		}
 		nsi.Flags = osi.Flags
 	}
 	if s := r.Header.Get(apc.HdrNodeFlags); s != "" {
@@ -305,16 +315,16 @@ func (c *clupost) validate() (stop bool) {
 		}
 		flags := cos.BitFlags(fl)
 		if flags != 0 {
-			nsi.Flags = nsi.Flags.Set(meta.SnodeNonElectable)
-			// [NOTE]
-			// - limiting support to 'non-electability'
-			// - rest upon demand, including resetting non-electable -> electable
+			// apc.HdrNodeFlags header currently supports only proxy non-electability
 			if !nsi.IsProxy() || flags != meta.SnodeNonElectable {
-				p.writeErrf(w, r, "%s joining %s: expecting only 'non-electable' bit (and only proxies), got %s=%s",
-					p, nsi, apc.HdrNodeFlags, nsi.Fl2S())
+				p.writeErrf(w, r, "%s joining %s: expecting only 'non-electable' bit (and only proxies), got %s=%q",
+					p, nsi, apc.HdrNodeFlags, s)
 				return true
 			}
+			nsi.Flags = nsi.Flags.Set(meta.SnodeNonElectable)
 		}
+	} else if c.apiOp == apc.AdminJoin && nsi.IsProxy() {
+		nsi.Flags = nsi.Flags.Clear(meta.SnodeNonElectable)
 	}
 
 	c.flags = nsi.Flags
@@ -528,7 +538,7 @@ func (c *clupost) rereg(osi *meta.Snode) bool {
 		nlog.Warningf("%s: %s(flags %s, fp %q) => %s(flags %s, fp %q) - restarted with a new verifying key",
 			p, osi.StringEx(), osi.Fl2S(), ofp, nsi.StringEx(), nsi.Fl2S(), nfp)
 		return true
-	case !osi.EqNetID(nsi) || osi.Flags != nsi.Flags:
+	case !osi.EqNetID(nsi) || osi.Flags != nsi.Flags: // see apc.HdrNodeFlags handling above
 		// also ref0417 (ais/earlystart)
 		nlog.Warningf("%s: renewing %s(flags %s) => %s(flags %s)", p, osi.StringEx(), osi.Fl2S(), nsi.StringEx(), nsi.Fl2S())
 		return true

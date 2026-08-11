@@ -1,6 +1,6 @@
 // Package api provides native Go-based API/SDK over HTTP(S).
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package api
 
@@ -474,6 +474,9 @@ func _backend(bp BaseParams, path string) error {
 // - 'ais cluster add-remove-nodes --help'
 // - docs/lifecycle_node.md
 func membership(bp BaseParams, action string, actValue *apc.ActValRmNode) (xid string, err error) {
+	if _, err := actValue.GetIDs(); err != nil {
+		return "", err
+	}
 	msg := apc.ActMsg{
 		Action: action,
 		Value:  actValue,

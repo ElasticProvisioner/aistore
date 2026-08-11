@@ -48,6 +48,16 @@ type (
 	nodeRegPool []cluMeta
 
 	// proxy runner
+	primary struct {
+		reg struct {
+			pool        nodeRegPool       // bootstrap (see ais/earlystart)
+			verMismatch map[string]string // nodeID -> version != primary's; absence means no mismatch; Smap remains the source of truth
+			mpl         sync.RWMutex
+			mtv         sync.Mutex
+		}
+
+		fastKalive atomic.Bool // can accept fast keepalives
+	}
 	proxy struct {
 		ic         ic
 		authn      *authManager
@@ -60,22 +70,17 @@ type (
 
 		notifs notifs
 
-		// primary-only
-		reg struct {
-			pool        nodeRegPool       // bootstrap (see ais/earlystart)
-			verMismatch map[string]string // nodeID -> version != primary's; absence means no mismatch; Smap remains the source of truth
-			mpl         sync.RWMutex
-			mtv         sync.Mutex
-		}
-
 		remais struct {
 			old []*meta.RemAis // to facilitate a2u resolution (and, therefore, offline access)
 			meta.RemAisVec
 			mu sync.RWMutex
 			in atomic.Bool
 		}
-		settingNewPrimary atomic.Bool // primary executing "set new primary" request (state)
-		readyToFastKalive atomic.Bool // primary can accept fast keepalives
+
+		settingNewPrimary atomic.Bool // when executing "set new primary" request (transition)
+
+		// primary-only
+		prim *primary
 	}
 )
 
@@ -91,6 +96,17 @@ type (
 var _ cos.Runner = (*proxy)(nil)
 
 func (*proxy) Name() string { return apc.Proxy } // as cos.Runner
+
+func (p *proxy) primary() *primary {
+	debug.Assert(p.prim != nil, p.String())
+	return p.prim
+}
+
+func (p *proxy) iniPrimaryState() {
+	if p.prim == nil {
+		p.prim = &primary{}
+	}
+}
 
 func (p *proxy) init(config *cmn.Config) {
 	p.initPhase1(config)
@@ -197,7 +213,6 @@ func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebal
 func (p *proxy) Run() error {
 	config := cmn.GCO.Get()
 	p.htrun.initPhase2(config)
-	p.setusr1()
 	p.owner.bmd = newBMDOwnerPrx(config)
 	p.owner.etl = newEtlMDOwnerPrx(config)
 
@@ -970,7 +985,7 @@ func (p *proxy) httpobjput(w http.ResponseWriter, r *http.Request, apireq *apiRe
 	} else {
 		if tsi = smap.GetTarget(nodeID); tsi == nil {
 			p.statsT.IncWith(errcnt, vlabs)
-			err = &errNodeNotFound{p.si, smap, verb + " failure:", nodeID}
+			err = &errNodeNotFound{si: p.si, smap: smap, msg: verb + " failure:", id: nodeID}
 			p.writeErr(w, r, err)
 			return
 		}
@@ -2119,7 +2134,7 @@ func (p *proxy) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *apiR
 		if args.DaemonID != "" {
 			smap := p.owner.smap.get()
 			if tsi = smap.GetTarget(args.DaemonID); tsi == nil {
-				err := &errNodeNotFound{p.si, smap, apc.ActPromote + " failure:", args.DaemonID}
+				err := &errNodeNotFound{si: p.si, smap: smap, msg: apc.ActPromote + " failure:", id: args.DaemonID}
 				p.writeErr(w, r, err)
 				return
 			}
