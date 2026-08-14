@@ -23,7 +23,7 @@ The third and final special state is **decommission**. Loosely synonymous with c
 * partial or complete cleanup of the node itself; and
 * removing AIS metadata, configuration files, and, optionally, user data in its entirety.
 
-Needless to say, there's no simple way back out of `decommission` - the proverbial point of no return. To rejoin the cluster after a completed decommission, the node must be rejoined or redeployed, depending on how far the cleanup progressed and whether local AIS metadata and data were removed.
+Needless to say, there's no simple way back out of `decommission` - the proverbial point of no return. A decommissioned node does not come back by restarting it: depending on how far the cleanup progressed, it must be re-added with an explicit `join` or redeployed from scratch.
 
 ## Table of Contents
 
@@ -35,7 +35,9 @@ Needless to say, there's no simple way back out of `decommission` - the proverbi
   - [Quick Example](#quick-example)
 - [Putting a Node in Maintenance](#putting-a-node-in-maintenance)
   - [Batch Operations](#batch-operations)
+  - [Incomplete Transitions](#incomplete-transitions)
   - [Skipping Rebalance](#skipping-rebalance)
+- [One Membership Change at a Time](#one-membership-change-at-a-time)
 - [Clearing Maintenance State](#clearing-maintenance-state)
 - [Removing a Node from a Cluster](#removing-a-node-from-a-cluster)
 - [Checking Removal Status](#checking-removal-status)
@@ -107,15 +109,18 @@ $ ais config cluster auth --json
             "allowed_iss": null
         },
         "intra_cluster": {
-            "enabled": false,
+            "request_auth": false,
+            "self_join_auth": false,
             "ttl": "0s",
             "nonce_window": "1m",
             "rotation_grace": "1m"
         },
-        "enabled": false ### <<<<< authentication disabled
+        "client_auth_required": false
     }
 }
 ```
+
+Here, `client_auth_required: false` means protected client requests do not require authentication.
 
 * use the integrated `AuthN` server, which provides OAuth 2.0-compliant JWTs and a set of [CLI auth commands](/docs/cli/auth.md) to manage users, roles, and permissions; or
 * outsource authorization to a separate centralized system, often LDAP-integrated, that manages existing users, groups, and mappings.
@@ -207,7 +212,7 @@ If the node is a target, the cluster will rebalance after a short preparation ph
 
 The batch executes as one coordinated operation. Each lifecycle phase updates the cluster map once for
 the entire batch. When rebalance is required, the cluster performs one RMD increment and starts
-one global rebalance, regardless of how many nodes you name:
+one global rebalance, regardless of how many nodes you specify:
 
 ```console
 $ ais cluster add-remove-nodes start-maintenance <TAB-TAB>
@@ -233,16 +238,58 @@ Waiting for rebalance[g1] ...
 Done.
 ```
 
-Admission is all-or-nothing: if any named node is unknown, is the current primary, or is already in
-maintenance, the entire request is rejected and no node is touched. Conversely, once the transaction is
-underway, a node that disappears - keepalive-removed, for instance - does not abort it; the remaining
-nodes complete normally.
+Admission is all-or-nothing: if any specified node is unknown or is the current primary, the entire request
+is rejected and no node is touched. Conversely, once the transaction is underway, a node that
+disappears - keepalive-removed, for instance - does not abort it; the remaining nodes complete
+normally.
 
-Operation-specific state checks also apply (for example, `start-maintenance`/`shutdown`/`decommission`
-reject nodes already in maintenance, while `stop-maintenance` requires nodes currently in maintenance).
+Operation-specific state checks also apply. `start-maintenance` skips a node that has already completed
+the same transition, and `stop-maintenance` skips a node that is already active. If every specified node is
+skipped, the command reports "nothing to do" and leaves the cluster map untouched. A node in
+maintenance can be advanced to `shutdown` or `decommission`; `stop-maintenance` refuses a node that
+is being decommissioned.
 
-While a global rebalance is running, further membership changes are rejected. Wait for it to finish
-(`ais show rebalance`) before issuing the next batch.
+Note that advancing a node that is already in maintenance does not rebalance: its data was migrated
+when it entered maintenance, and the batch contains no active target to migrate from. If it entered
+maintenance with `--no-rebalance`, that migration never happened - run `ais start rebalance` first, or
+the data stored **only on that target may become unavailable** when it is shut down or removed.
+
+
+### Incomplete Transitions
+
+Each of the three removal operations is a three-phase transition:
+
+```console
+`start-maintenance` | `shutdown-node` | `decommission`  =>  global rebalance  =>  post-rebalance step
+```
+
+The first phase marks the node in the cluster map. The second migrates its data. The third records
+completion: for `start-maintenance` and `shutdown`, the target is marked post-rebalance; for
+`decommission`, the node is removed from the cluster map altogether.
+
+The middle phase can abort - renewed by a concurrent self-join, or aborted because another target left
+the cluster (e.g., via K8s delete-pod => SIGTERM => `rmSelf`). When it does, the third phase never runs
+and the target simply stays in `maintenance`. `--no-rebalance` reaches the same place by skipping the
+middle phase outright, and the two are indistinguishable from the primary's perspective.
+
+Either way, the target is in maintenance and out of service. The operator can:
+
+* repeat `start-maintenance`. This is accepted rather than rejected, so a retry - or a rolling-upgrade
+  script that reissues one - does not fail. It keeps the target out of service and reapplies maintenance
+  on the node when reachable. If no active target is specified alongside, that is all it does;
+* run `stop-maintenance` to clear maintenance and return the target to service, with rebalance as
+  required;
+* advance the target to `shutdown` or `decommission`; or
+* leave it in maintenance. An explicit `ais start rebalance` can restore global data placement, but does
+  not itself complete the transition.
+
+> Such a target specified together with an active one follows the normal batch path. With automatic
+> rebalance enabled and without `--no-rebalance`, that batch rebalances, and its post-rebalance step
+> completes the transition for both.
+>
+> Specifying it together with a target that has already completed the transition changes nothing: the
+> completed target is skipped, and the command behaves as if only the incomplete one had been
+> specified.
 
 ### Skipping Rebalance
 
@@ -262,10 +309,45 @@ Keeping automatic rebalance enabled is strongly recommended, but there are cases
 
 * all buckets are empty;
 * maintenance was started with `--no-rebalance` and no objects were added or updated during maintenance;
-* all objects can be refetched from remote backends such as remote AIS, HTTP, or cloud buckets, understanding that this may incur extra cloud traffic charges; or
+* all objects can be refetched from remote backends such as remote AIS or cloud buckets, understanding that this may incur extra cloud traffic charges; or
 * multiple nodes are being returned from maintenance, in which case name them all in a single `stop-maintenance` command - see [Batch Operations](#batch-operations) - rather than sequencing them with `--no-rebalance`.
 
 The `--no-rebalance` flag is available for `start-maintenance`, `shutdown`, `stop-maintenance`, and `decommission`.
+
+## One Membership Change at a Time
+
+The primary admits one administrative membership change at a time. A second request issued while the
+first is still executing is refused. If the first request starts a global rebalance, the exclusion
+continues until that rebalance reaches a terminal state:
+
+```console
+$ ais cluster add-remove-nodes start-maintenance t[HbjTwLpS] --yes
+Started rebalance "g1" (to monitor, run 'ais show rebalance').
+t[HbjTwLpS] is now in maintenance mode
+
+$ ais cluster add-remove-nodes start-maintenance t[QrmZvKdN] --yes
+Error: ErrBusy: cluster membership "start-maintenance" is currently busy (rebalance[g1] is running), please try again
+```
+
+The rule covers `start-maintenance`, `stop-maintenance`, `shutdown`, `decommission`, the advanced
+unsafe removal command, explicit `join`, and an operator-initiated `ais start rebalance` with or
+without `--cleanup`.
+
+There are two deliberate qualifications:
+
+* **Self-join is not serialized.** A node starting or restarting and registering on its own - including
+  normal Kubernetes restart and scale-up paths - is not subject to the administrative admission guard.
+  It may join while a rebalance is running and cause that rebalance to be renewed.
+* **An exact inverse is not exempt.** Taking the same nodes back out of maintenance while their causal
+  rebalance is running is refused like any other membership change. Wait for the rebalance to finish
+  (`ais show rebalance`), then reactivate the nodes.
+
+Do not abort a lifecycle-triggered rebalance merely to issue its inverse. Lifecycle operations are not
+rollback transactions: aborting rebalance does not restore the preceding Smap, can leave maintenance
+or shutdown transitions incomplete, and does not necessarily prevent decommission finalization.
+
+To transition several nodes together, specify them in one command - see
+[Batch Operations](#batch-operations) - rather than issuing requests one after another.
 
 ## Clearing Maintenance State
 
@@ -279,7 +361,7 @@ Started rebalance "g3" (to monitor, run 'ais show rebalance').
 t[QrmZvKdN] is now active
 ```
 
-To skip automatic rebalance, provide `--no-rebalance` (advanced usage only; see [Skipping Rebalance](#skipping-rebalance).
+To skip automatic rebalance, provide `--no-rebalance` (advanced usage only; see [Skipping Rebalance](#skipping-rebalance)).
 
 > In general, automatic rebalance should remain enabled. The same considerations listed under [Skipping Rebalance](#skipping-rebalance) apply here as well.
 
@@ -353,11 +435,20 @@ XvnGkRdM         0.13%           31.28GiB        16%             2.435TiB       
 | take node out of maintenance | `stop-maintenance`              | Re-enable keepalive, update the node with current cluster metadata, run global rebalance, and return the node to `online`.                                                 |
 | join new node                | `join`                          | Update the node, synchronize current cluster metadata, and run global rebalance as needed.                                                                                 |
 
+All of the above are administrative membership changes. The cluster admits one at a time and refuses
+another while global rebalance is running; see
+[One Membership Change at a Time](#one-membership-change-at-a-time). A node's own self-join is not
+subject to this rule.
+
 ### Assorted Notes
 
 Normally, a starting AIS node (`aisnode`) uses its local [configuration](/docs/configuration.md) to contact the cluster and perform a self-join. That does not require an explicit `join` command or any separate administrative action.
 
 Still, the `join` command is useful when the node is misconfigured. Separately, it can also be used to join a standby node - that is, a node started in standby mode; see [`aisnode` command line](/docs/command_line.md).
+
+The explicit `join` command is an administrative membership change and is serialized with the other
+operations. A node's own self-join is not; see
+[One Membership Change at a Time](#one-membership-change-at-a-time).
 
 During rebalance, the cluster remains fully operational: users can read and write data, list, create, and destroy buckets, run jobs, and so on. In other words, none of the lifecycle operations described here requires downtime.
 

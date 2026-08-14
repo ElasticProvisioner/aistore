@@ -59,7 +59,9 @@ var (
 		"distributed_sort.ekm_malformed_line": dsortSupportedReactions,
 		"distributed_sort.ekm_missing_key":    dsortSupportedReactions,
 		"distributed_sort.missing_shards":     dsortSupportedReactions,
-		"auth.enabled":                        supportedBool,
+		"auth.client_auth_required":           supportedBool,
+		"auth.intra_cluster.request_auth":     supportedBool,
+		"auth.intra_cluster.self_join_auth":   supportedBool,
 		"checksum.enabl_read_range":           supportedBool,
 		"checksum.validate_cold_get":          supportedBool,
 		"checksum.validate_warm_get":          supportedBool,
@@ -553,8 +555,6 @@ func bpropsFilterExtra(c *cli.Context, tag string) bool {
 		return strings.HasPrefix(tag, "extra.aws")
 	case apc.OCIScheme, apc.OCI:
 		return strings.HasPrefix(tag, "extra.oci")
-	case apc.HT:
-		return strings.HasPrefix(tag, "extra.http")
 	}
 	return false
 }

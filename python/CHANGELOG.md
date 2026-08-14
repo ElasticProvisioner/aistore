@@ -27,9 +27,17 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 - ETL inspection APIs: `Bucket.inspect()` and `ObjectGroup.inspect()` run ETL
   in dry-run mode without writing transformed results, while preserving the
   existing ETL object-error reporting path.
+- `partition_sources_by_worker` flag on `AISBaseIterDataset` (inherited by
+  `AISIterDataset`, `AISBatchIterDataset`, `AISShardReader`) distributes
+  `ais_source_list` across DataLoader workers so each worker only lists its
+  assigned sources, avoiding duplicate paged listing calls that otherwise
+  multiply by `num_workers`.
+- `colocation` parameter on `AISBatchIterDataset`, forwarded to the MOSS
+  batch API to enable target-aware and shard-aware optimizations.
 
 ### Changed
 
+- **BREAKING**: Removed the unsupported `Provider.HTTP` (`ht://`) backend.
 - **BREAKING**: AuthN cluster registration now verifies AIStore TLS
   certificates by default. Deployments using untrusted certificates must
   configure `ca_cert` or explicitly set `skip_verify=True`.

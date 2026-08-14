@@ -45,7 +45,7 @@ func (p *proxy) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.Bc
 	// default props & flags => user-provided message
 	lsmsg.NormalizeNameSizeDflt()
 
-	if bck.IsHT() || lsmsg.IsFlagSet(apc.LsArchDir) {
+	if lsmsg.IsFlagSet(apc.LsArchDir) {
 		lsmsg.SetFlag(apc.LsCached)
 	}
 
@@ -321,6 +321,7 @@ func (p *proxy) lsObjsR(bck *meta.Bck, lsmsg *apc.LsoMsg, hdr http.Header, smap 
 	bargs.smap = smap
 	bargs.cresv = cresmGeneric[cmn.LsoRes]{}
 	bargs.network = cmn.NetIntraControl // note: targets => proxy to merge pages - over control-net
+	bargs.allAtOnce = true
 
 	switch {
 	case wantOnlyRemote:

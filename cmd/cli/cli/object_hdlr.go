@@ -516,13 +516,11 @@ func warnMultiSrcDstPrefix(c *cli.Context, a *putargs, from string) bool {
 	if a.dst.oname == "" || cos.IsLastB(a.dst.oname, '/') {
 		return true
 	}
-	warn := fmt.Sprintf("'%s' will be used as the destination name prefix for all files %s",
+	actionWarnf(c, "'%s' will be used as the destination name prefix for all files %s",
 		a.dst.oname, from)
-	actionWarn(c, warn)
 	if _, err := archive.Mime(a.dst.oname, ""); err == nil {
-		warn := fmt.Sprintf("did you want to use 'archive put' instead, with %q as the destination shard?",
+		actionWarnf(c, "did you want to use 'archive put' instead, with %q as the destination shard?",
 			a.dst.oname)
-		actionWarn(c, warn)
 	}
 	if !flagIsSet(c, yesFlag) {
 		if ok := confirm(c, "Proceed anyway?"); !ok {
@@ -584,7 +582,7 @@ func concatHandler(c *cli.Context) (err error) {
 	if bck, objName, err = parseBckObjURI(c, fullObjName, false); err != nil {
 		return
 	}
-	if shouldHeadRemote(c, bck) {
+	if shouldHeadRemote(c) {
 		if _, err = headBucket(bck, false /* don't add */); err != nil {
 			return
 		}
@@ -613,7 +611,7 @@ func promoteHandler(c *cli.Context) (err error) {
 	if bck, objName, err = parseBckObjURI(c, fullObjName, true /*optObjName*/); err != nil {
 		return
 	}
-	if shouldHeadRemote(c, bck) {
+	if shouldHeadRemote(c) {
 		if _, err = headBucket(bck, false /* don't add */); err != nil {
 			return
 		}

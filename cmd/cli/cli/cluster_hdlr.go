@@ -332,9 +332,8 @@ func clusterShutdownHandler(c *cli.Context) error {
 		return err
 	}
 	if !flagIsSet(c, yesFlag) {
-		warn := fmt.Sprintf("shutting down cluster (UUID=%s, primary=[%s, %s])",
+		actionWarnf(c, "shutting down cluster (UUID=%s, primary=[%s, %s])",
 			smap.UUID, smap.Primary.ID(), smap.Primary.PubNet.URL)
-		actionWarn(c, warn)
 		if !confirm(c, "Proceed?") {
 			return nil
 		}
@@ -365,9 +364,8 @@ func clusterDecommissionHandler(c *cli.Context) error {
 		return err
 	}
 	if !flagIsSet(c, yesFlag) {
-		warn := fmt.Sprintf("about to permanently decommission cluster (UUID=%s, primary=[%s, %s]).",
+		actionWarnf(c, "about to permanently decommission cluster (UUID=%s, primary=[%s, %s]).",
 			smap.UUID, smap.Primary.ID(), smap.Primary.PubNet.URL)
-		actionWarn(c, warn)
 		if !confirm(c, "The operation cannot be undone. Proceed?") {
 			return nil
 		}
@@ -471,8 +469,9 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	}
 	action := c.Command.Name
 	var (
-		nodeArgs  = make([]string, 0, c.NArg())
-		hasTarget bool
+		nodeArgs     = make([]string, 0, c.NArg())
+		outOfService []string
+		hasTarget    bool
 	)
 	for _, arg := range c.Args() {
 		for _, nodeArg := range splitCsv(arg) {
@@ -504,6 +503,10 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 		snames = append(snames, sname)
 		daemonIDs = append(daemonIDs, node.ID())
 		hasTarget = hasTarget || node.IsTarget()
+		if node.IsTarget() && node.InMaintOrDecomm() {
+			// inactive and will not rebalance - see warning below
+			outOfService = append(outOfService, sname)
+		}
 	}
 
 	// make apc.ActValRmNode
@@ -521,11 +524,23 @@ func nodeMaintShutDecommHandler(c *cli.Context) error {
 	)
 	actValue.SetIDs(daemonIDs...)
 	if skipRebalance && hasTarget {
-		warn := fmt.Sprintf("executing %q _and_ not running global rebalance may lead to a loss of data!", action)
-		actionWarn(c, warn)
+		actionWarnf(c, "executing %q _and_ not running global rebalance may lead to a loss of data!", action)
 		fmt.Fprintln(c.App.Writer,
 			"To rebalance the cluster manually at a later time, run: `ais start rebalance`")
 	}
+	// removing (or shutting down) a node that is already out of service never rebalances:
+	// the cluster has no active target to migrate from. If the node went out of service
+	// with no rebalance, its data was never migrated and leaves with it.
+	if len(outOfService) > 0 && (action == cmdNodeDecommission || action == cmdShutdown) {
+		verb := "shut down"
+		if action == cmdNodeDecommission {
+			verb = "removed"
+		}
+		actionWarnf(c, "%s: already out of service - will be %s without migrating data; if %s was used "+
+			"to take it out, run `ais start rebalance` first (and wait for it to finish)",
+			strings.Join(outOfService, ", "), verb, qflprn(noRebalanceFlag))
+	}
+
 	if action == cmdNodeDecommission {
 		actValue.NoShutdown = noShutdown
 		actValue.RmUserData = rmUserData
@@ -643,12 +658,11 @@ func setPrimaryHandler(c *cli.Context) error {
 			if e != nil {
 				return V(e)
 			}
-			warn := fmt.Sprintf("about to force-join cluster (UUID=%s, primary=[%s, %s]) to a different cluster where primary=[%s, %s]\n"+
+			actionWarnf(c, "about to force-join cluster (UUID=%s, primary=[%s, %s]) to a different cluster where primary=[%s, %s]\n"+
 				"Prerequisite: destination cluster rebalance must be disabled, e.g.:\n"+
 				"  AIS_ENDPOINT=%s ais config cluster rebalance.enabled false",
 				smap.UUID, smap.Primary.ID(), smap.Primary.PubNet.URL, pid, toURL, toURL,
 			)
-			actionWarn(c, warn)
 			if !confirm(c, "The operation cannot be undone. Proceed?") {
 				return nil
 			}
@@ -754,8 +768,7 @@ func startRebHandler(c *cli.Context) (err error) {
 	if flagIsSet(c, syncFlag) {
 		xargs.Flags |= xact.FlagSync
 		if xargs.Flags&xact.FlagLatestVer != 0 {
-			warn := fmt.Sprintf("%s implies %s (the latter is redundant)", qflprn(syncFlag), qflprn(latestVerFlag))
-			actionWarn(c, warn)
+			actionWarnf(c, "%s implies %s (the latter is redundant)", qflprn(syncFlag), qflprn(latestVerFlag))
 		}
 	}
 

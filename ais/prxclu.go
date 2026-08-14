@@ -615,35 +615,34 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 		}
 	}
 	// 2. AuthN
-	if toUpdate.Auth != nil && toUpdate.Auth.Enabled != nil {
-		authEnabled := *toUpdate.Auth.Enabled
+	if toUpdate.Auth != nil && toUpdate.Auth.ClientAuthRequired != nil {
+		clientAuthRequired := *toUpdate.Auth.ClientAuthRequired
 
-		if !config.Auth.Enabled && authEnabled {
-			// enabling auth - always validate
+		if !config.Auth.ClientAuthRequired && clientAuthRequired {
+			// requiring client authentication - always validate
 			clone := new(cmn.AuthConf)
 			cos.CopyStruct(clone, &config.Auth)
 			config.Auth.CopyTo(clone)
 
-			if ecode, err := p.validateEnableAuth(r, clone, toUpdate.Auth); err != nil {
+			if ecode, err := p.validateRequireClientAuth(r, clone, toUpdate.Auth); err != nil {
 				p.writeErr(w, r, err, ecode)
 				return
 			}
 		}
-		if config.Auth.Enabled != authEnabled {
-			_warnUpd("config.auth JWT/OIDC", strconv.FormatBool(config.Auth.Enabled), strconv.FormatBool(authEnabled))
+		if config.Auth.ClientAuthRequired != clientAuthRequired {
+			_warnUpd("config.auth.client_auth_required", strconv.FormatBool(config.Auth.ClientAuthRequired), strconv.FormatBool(clientAuthRequired))
 		}
-
-		if ic := toUpdate.Auth.IntraCluster; ic != nil && ic.Enabled != nil {
-			cur := config.Auth.IntraClusterConfigured() // raw config bit (compare with SignVerifyEnabled() runtime)
-			upd := *ic.Enabled
-			if !cur && upd && cmn.IsV50Bridge() {
-				p.writeErr(w, r, errors.New("intra-cluster auth (Ed25519 sign/verify) cannot be enabled on a v5.0 bridge release"),
-					http.StatusPreconditionFailed)
-				return
+	}
+	if toUpdate.Auth != nil && toUpdate.Auth.IntraCluster != nil &&
+		toUpdate.Auth.IntraCluster.RequestAuth != nil {
+		cur := config.Auth.IntraRequestAuthConfigured() // raw config bit (compare with SignVerifyEnabled() runtime)
+		upd := *toUpdate.Auth.IntraCluster.RequestAuth
+		if cmn.IsV50Bridge() {
+			if !cur && upd {
+				nlog.Warningln("intra-cluster auth (Ed25519 sign/verify) is a no-op on a v5.0 bridge release")
 			}
-			if cur != upd {
-				_warnUpd("config.auth.intra_cluster", strconv.FormatBool(cur), strconv.FormatBool(upd))
-			}
+		} else if cur != upd {
+			_warnUpd("config.auth.intra_cluster.request_auth", strconv.FormatBool(cur), strconv.FormatBool(upd))
 		}
 	}
 	// 3. Tracing
@@ -860,10 +859,6 @@ func (p *proxy) xstart(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 
 		var cleanup bool
 		if xargs.Flags&xact.FlagRemoveMisplaced != 0 {
-			if running, xid := p.notifs.isRebRunning(); running {
-				p.writeErrf(w, r, "cannot start rebalance in cleanup mode: rebalance[%s] is currently running", xid)
-				return
-			}
 			// special cleanup mode:
 			// piggy-back on the rebalance lifecycle (xreg, abort, status, rebID) to walk
 			// mountpaths and remove local copies of objects upon checking their respective
@@ -1062,6 +1057,17 @@ func (p *proxy) reloadCreds(w http.ResponseWriter, r *http.Request, msg *apc.Act
 
 // admin call
 func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg, cleanup bool) {
+	// disallow admin-initiated rebalance when membership change is in progress, and vice versa
+	action := apc.ActRebalance
+	if cleanup {
+		action += " --cleanup"
+	}
+	if err := p.beginMembership(action); err != nil {
+		p.writeErr(w, r, err)
+		return
+	}
+	defer p.endMembership()
+
 	smap := p.owner.smap.get()
 	if err := p.canRebalance(smap, cleanup); err != nil {
 		p.writeErr(w, r, err)
@@ -1078,6 +1084,7 @@ func (p *proxy) rebalanceCluster(w http.ResponseWriter, r *http.Request, msg *ap
 		}
 		nlog.Warningf("%s: not enough active targets (%d) - proceeding to rebalance cluster anyway", p, nat)
 	}
+
 	rmdCtx := &rmdModifier{
 		pre:     rmdInc,
 		final:   rmdSync,

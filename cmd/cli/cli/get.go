@@ -75,7 +75,7 @@ func getHandler(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if shouldHeadRemote(c, bck) {
+	if shouldHeadRemote(c) {
 		if bck.Props, err = headBucket(bck, false /* don't add */); err != nil {
 			return err
 		}
@@ -343,8 +343,7 @@ func getMultiObj(c *cli.Context, bck cmn.Bck, outFile string, lsarch, extract bo
 			}
 			if shardName == "" {
 				// should not be happening
-				warn := fmt.Sprintf("archived file %q: cannot find parent shard in the listed results", en.Name)
-				actionWarn(c, warn)
+				actionWarnf(c, "archived file %q: cannot find parent shard in the listed results", en.Name)
 				continue
 			}
 		}
@@ -533,7 +532,7 @@ func getObject(c *cli.Context, bck cmn.Bck, objName, outFile string, a qparamArc
 	}
 
 	// finally: http query and API call
-	getArgs.Query = a.getQuery(c, &bck)
+	getArgs.Query = a.getQuery(c)
 
 	// encode special symbols if requested
 	encObjName := warnEscapeObjName(c, objName, warned)
@@ -658,16 +657,11 @@ func (a *qparamArch) validate(c *cli.Context) error {
 
 func (a *qparamArch) enabled() bool { return a.archpath != "" || a.archregx != "" }
 
-func (a *qparamArch) getQuery(c *cli.Context, bck *cmn.Bck) (q url.Values) {
+func (a *qparamArch) getQuery(c *cli.Context) (q url.Values) {
 	f := func() {
 		if q == nil {
 			q = make(url.Values, 4)
 		}
-	}
-	if bck.IsHT() {
-		f()
-		uri := c.Args().Get(0)
-		q.Set(apc.QparamOrigURL, uri)
 	}
 	if a.archpath != "" {
 		f()

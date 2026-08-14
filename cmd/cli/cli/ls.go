@@ -94,17 +94,6 @@ func listBckTableNoSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, fl
 		if info.IsBckPresent {
 			footer.nbp++
 		}
-		if bck.IsHT() {
-			if bmd == nil {
-				bmd, err = api.GetBMD(apiBP)
-				if err != nil {
-					fmt.Fprintln(c.App.ErrWriter, err)
-					return 0
-				}
-			}
-			props, _ = bmd.Get(meta.CloneBck(&bck))
-			bck.Name += " (URL: " + props.Extra.HTTP.OrigURLBck + ")"
-		}
 		data = append(data, teb.ListBucketsHelper{Bck: bck, Props: props, Info: &info})
 	}
 	if len(data) == 0 {
@@ -178,8 +167,7 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 			if !partial {
 				continue
 			}
-			warn := fmt.Sprintf("%s[%s] %s - still running, showing partial results", cmdSummary, xid, bck.Cname(""))
-			actionWarn(c, warn)
+			actionWarnf(c, "%s[%s] %s - still running, showing partial results", cmdSummary, xid, bck.Cname(""))
 		}
 		footer.nb++
 		if info.IsBckPresent {
@@ -188,9 +176,6 @@ func listBckTableWithSummary(c *cli.Context, qbck cmn.QueryBcks, bcks cmn.Bcks, 
 			footer.robj += info.ObjCount.Remote
 			footer.size += info.TotalSize.OnDisk
 			footer.pct += int(info.UsedPct)
-		}
-		if bck.IsHT() {
-			bck.Name += " (URL: " + props.Extra.HTTP.OrigURLBck + ")"
 		}
 		data = append(data, teb.ListBucketsHelper{XactID: xid, Bck: bck, Props: props, Info: info})
 
@@ -372,8 +357,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 			return fmt.Errorf(errFmtExclusive, qflprn(diffFlag), qflprn(nameOnlyFlag))
 		}
 		if len(props) > 2 {
-			warn := fmt.Sprintf("flag %s is incompatible with the value of %s", qflprn(nameOnlyFlag), qflprn(objPropsFlag))
-			actionWarn(c, warn)
+			actionWarnf(c, "flag %s is incompatible with the value of %s", qflprn(nameOnlyFlag), qflprn(objPropsFlag))
 		}
 		msg.SetFlag(apc.LsNameOnly)
 		msg.Props = apc.GetPropsName
@@ -451,8 +435,7 @@ func listObjects(c *cli.Context, bck cmn.Bck, prefix string, listArch, printEmpt
 	}
 
 	if catOnly && flagIsSet(c, noFooterFlag) {
-		warn := fmt.Sprintf(errFmtExclusive, qflprn(countAndTimeFlag), qflprn(noFooterFlag))
-		actionWarn(c, warn)
+		actionWarnf(c, errFmtExclusive, qflprn(countAndTimeFlag), qflprn(noFooterFlag))
 	}
 
 	// list (and immediately show) pages, one page at a time

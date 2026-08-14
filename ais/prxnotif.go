@@ -326,15 +326,14 @@ func (n *notifs) findAll(flt nlFilter) (nls []nl.Listener) {
 	return
 }
 
-// isRebRunning reports whether a global rebalance is currently running cluster-wide,
-// per the primary's notification-listener registry. Returns the rebID when running.
-func (n *notifs) isRebRunning() (bool, string) {
+// return cmn.ErrBusy if global rebalance is currently running, `nil` otherwise
+func (n *notifs) errRebRunning(what string) error {
 	onl := true
 	flt := nlFilter{Kind: apc.ActRebalance, OnlyRunning: &onl}
 	if nl := n.find(flt); nl != nil {
-		return true, nl.UUID()
+		return cmn.NewErrBusy(membershipTag, what, "rebalance["+nl.UUID()+"] is running")
 	}
-	return false, ""
+	return nil
 }
 
 func (n *notifs) size() int32 {
@@ -579,8 +578,9 @@ func (n *notifs) ListenSmapChanged() {
 repeat:
 	for uuid, nl := range remnl {
 		sid := remid[uuid]
-		if nl.Kind() == apc.ActRebalance && nl.Cause() != "" { // for the cause, see ais/rebmeta
-			nlog.Infof("Warning: %s: %s is out, ignore 'smap-changed'", nl.String(), sid)
+		// use case: admin-driven membership change whereby this `sid` is legally inactive
+		if nl.Kind() == apc.ActRebalance && nl.Cause() != "" && smap.GetNode(sid) != nil { // for the cause, see ais/rebmeta
+			nlog.Infof("Warning: %s: %s is inactive, ignore 'smap-changed'", nl.String(), sid)
 			delete(remnl, uuid)
 			goto repeat
 		}

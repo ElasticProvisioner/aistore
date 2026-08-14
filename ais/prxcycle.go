@@ -33,6 +33,10 @@ import (
 // nodes in one Smap transaction. When required, that transaction increments
 // RMD once and starts one global rebalance.
 //
+// Two important helpers below, beginMembership/endMembership, admit exactly one
+// administrative membership change at a time (to track it, note the
+// post beginMembership flow: smap.modify => _rebPostRm => rmdModifier.listen).
+//
 // Rebalance completion resumes in rmdModifier.postRm (rebmeta.go), which
 // performs the final daemon action and then either removes the nodes from Smap
 // (decommission) or marks targets SnodeMaintPostReb (maintenance and shutdown).
@@ -49,7 +53,25 @@ import (
 //
 // ===========================================================================================
 
-var errSmapNoChange = errors.New("cluster membership: no change")
+const membershipTag = "cluster membership"
+
+var errSmapNoChange = errors.New(membershipTag + ": no change") // mcastUnreg sentinel
+
+func (p *proxy) beginMembership(action string) error {
+	inflight := &p.primary().membershipTxn
+	if !inflight.CAS(false, true) {
+		return cmn.NewErrBusy(membershipTag, action)
+	}
+	if err := p.notifs.errRebRunning(action); err != nil {
+		inflight.Store(false)
+		return err
+	}
+	return nil
+}
+
+func (p *proxy) endMembership() {
+	p.primary().membershipTxn.Store(false)
+}
 
 // gracefully remove node via apc.ActStartMaintenance, apc.ActDecommission, apc.ActShutdownNode
 // +gen:payload apc.ActStartMaintenance={"action": "start-maintenance", "value": {"sids": ["target_id1", "target_id2"], "skip_rebalance": false}}
@@ -57,10 +79,7 @@ var errSmapNoChange = errors.New("cluster membership: no change")
 // +gen:payload apc.ActShutdownNode={"action": "shutdown-node", "value": {"sids": ["target_id1", "target_id2"], "skip_rebalance": false}}
 // +gen:payload apc.ActRmNodeUnsafe={"action": "remove-node-unsafe", "value": {"sids": ["target_id1", "target_id2"], "skip_rebalance": false}}
 func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
-	var (
-		opts apc.ActValRmNode
-		smap = p.owner.smap.get()
-	)
+	var opts apc.ActValRmNode
 	if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
 		p.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, p.si, msg.Action, msg.Value, err)
 		return
@@ -70,11 +89,20 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 		p.writeErr(w, r, errN)
 		return
 	}
+
+	if err := p.beginMembership(msg.Action); err != nil {
+		p.writeErr(w, r, err)
+		return
+	}
+	defer p.endMembership()
+
 	var (
-		nodes           = make(meta.Nodes, 0, len(sids))
-		snames          = make([]string, 0, len(sids))
-		hasTarget       bool
-		hasActiveTarget bool
+		smap           = p.owner.smap.get()
+		nodes          = make(meta.Nodes, 0, len(sids))
+		snames         = make([]string, 0, len(sids))
+		noPostReb      int
+		activeSelected int // selected targets that are currently active
+		hasTarget      bool
 	)
 	for _, sid := range sids {
 		si := smap.GetNode(sid)
@@ -95,8 +123,9 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 			switch msg.Action {
 			case apc.ActDecommissionNode, apc.ActDecommissionCluster, apc.ActShutdownNode,
 				apc.ActShutdownCluster, apc.ActRmNodeUnsafe:
-				if running, xid := p.notifs.isRebRunning(); running {
-					p.writeErrf(w, r, "rebalance[%s] is currently running, please try (%s %s) later", xid, msg.Action, sname)
+				// defensive: admission is held, but self-join is not gated
+				if err := p.notifs.errRebRunning(msg.Action + " " + sname); err != nil {
+					p.writeErr(w, r, err)
 					return
 				}
 				if !smap.InMaint(si) {
@@ -113,17 +142,19 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 					nlog.Warningln(p.String(), msg.Action, sname, "is already in maintenance mode - skipping")
 					continue
 				default:
-					// SnodeMaint w/out SnodeMaintPostReb: cannot tell a finished
-					// (--no-rebalance) operation from an interrupted one
-					p.writeErrMsg(w, r, sname+" is transitioning to maintenance mode (post-rebalance not confirmed)")
-					return
+					// SnodeMaint w/out SnodeMaintPostReb: cannot tell a finished (--no-rebalance) operation
+					// from rebalance renewed by a concurrent self-join, or its listener aborted because
+					// another target left (SIGTERM => rmSelf) the cluster. Either way, keep the node in maintenance.
+					// See section "Incomplete Transitions" in docs/lifecycle_node.md.
+					nlog.Warningln(p.String(), msg.Action, sname, "- post-rebalance not confirmed, proceeding anyway")
+					noPostReb++
 				}
 			}
 		}
 		if si.IsTarget() {
 			hasTarget = true
 			if !inMaint {
-				hasActiveTarget = true
+				activeSelected++
 			}
 		}
 		nodes = append(nodes, si)
@@ -137,11 +168,20 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 
 	nlog.Infof("%s: %s(%v) opts=%v", p, msg.Action, snames, opts)
 	if hasTarget {
-		// TODO -- FIXME: membership-change vs other membership-change
-		if running, xid := p.notifs.isRebRunning(); running {
-			p.writeErrf(w, r, "rebalance[%s] is currently running, please try (%s %v) later", xid, msg.Action, snames)
+		// defensive: admission is held, but self-join is not gated
+		if err := p.notifs.errRebRunning(msg.Action + " " + strings.Join(snames, ", ")); err != nil {
+			p.writeErr(w, r, err)
 			return
 		}
+	}
+
+	if noPostReb == len(nodes) {
+		debug.Assert(msg.Action == apc.ActStartMaintenance)
+		ecode, err := p.rmNodesFinal(msg, nodes, snames, nil)
+		if err != nil {
+			p.writeErr(w, r, cmn.NewErrFailedTo(p, msg.Action, snames, err), ecode)
+		}
+		return
 	}
 
 	if msg.Action == apc.ActRmNodeUnsafe {
@@ -153,13 +193,29 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 		}
 		ecode, err := p.rmNodesFinal(msg, nodes, snames, nil)
 		if err != nil {
+			if cmn.IsErrBusy(err) {
+				p.writeErr(w, r, err)
+				return
+			}
 			p.writeErr(w, r, cmn.NewErrFailedTo(p, msg.Action, snames, err), ecode)
 		}
 		return
 	}
 
-	reb := !opts.SkipRebalance && cmn.GCO.Get().Rebalance.Enabled && hasActiveTarget
-	nlog.Infof("%s: %s reb=%t %v", p, msg.Action, reb, sids)
+	var (
+		skipReb = opts.SkipRebalance || !cmn.GCO.Get().Rebalance.Enabled
+		needReb = activeSelected > 0 && smap.CountActiveTs() > activeSelected
+		reb     = !skipReb && activeSelected > 0
+	)
+	if skipReb && needReb {
+		// migration could run but is suppressed by policy: the selected target(s) hold data
+		// that will _not_ be migrated, and there are active targets to migrate it to
+		nlog.Warningf("%s: %s reb=%t %v - executing %q _and_ not running global rebalance may lead to "+
+			"a loss of data; to rebalance manually at a later time, run: `ais start rebalance`",
+			p, msg.Action, reb, sids, msg.Action)
+	} else {
+		nlog.Infof("%s: %s reb=%t %v", p, msg.Action, reb, sids)
+	}
 
 	if reb {
 		if err := p.canRebalance(smap, false /*cleanup mode*/); err != nil {
@@ -173,6 +229,10 @@ func (p *proxy) rmNode(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) 
 	}
 	rebID, err := p.rmTargets(nodes, snames, msg, reb)
 	if err != nil {
+		if cmn.IsErrBusy(err) {
+			p.writeErr(w, r, err)
+			return
+		}
 		p.writeErr(w, r, cmn.NewErrFailedTo(p, msg.Action, snames, err))
 		return
 	}
@@ -269,9 +329,8 @@ func (p *proxy) _markMaint(ctx *smapModifier, clone *smapX) error {
 		hasTarget = hasTarget || si.IsTarget()
 	}
 	if hasTarget {
-		if running, xid := p.notifs.isRebRunning(); running {
-			return fmt.Errorf("rebalance[%s] is currently running, please try (%s %s) later",
-				xid, ctx.msg.Action, strings.Join(ctx.sids, ", "))
+		if err := p.notifs.errRebRunning(ctx.msg.Action + " " + strings.Join(ctx.sids, ", ")); err != nil {
+			return err
 		}
 	}
 	for _, sid := range ctx.sids {
@@ -371,15 +430,20 @@ func (p *proxy) _earlyGFN(ctx *smapModifier, si *meta.Snode, action string, join
 		return nil
 	}
 
-	// early-GFN notification with an empty (version-only and not yet updated) Smap and
-	// message(new target's ID)
-	msg := p.newAmsgActVal(apc.ActStartGFN, nil)
-	msg.UUID = si.ID()
-	revs := revsPair{&smapX{Smap: meta.Smap{Version: smap.Version}}, msg}
+	return p._notifyEarlyGFN(ctx, smap, si)
+}
+
+// keeping separate from _earlyGFN: stop-maintenance can rebalance while reactivating
+// multiple targets when there are currently zero active targets
+func (p *proxy) _notifyEarlyGFN(ctx *smapModifier, smap *smapX, tsi *meta.Snode) error {
+	// Notify targets before publishing the updated Smap.
+	actMsgExt := p.newAmsgActVal(apc.ActStartGFN, nil)
+	actMsgExt.UUID = tsi.ID()
+	revs := revsPair{&smapX{Smap: meta.Smap{Version: smap.Version}}, actMsgExt}
 	if fcnt := p.metasyncer.notify(true /*wait*/, revs); fcnt > 0 {
 		return fmt.Errorf("failed to notify early-gfn (%d)", fcnt)
 	}
-	ctx.gfn = true // to undo if need be
+	ctx.gfn = true
 	return nil
 }
 
@@ -623,8 +687,8 @@ func (p *proxy) _unregNodesPre(ctx *smapModifier, clone *smapX) error {
 		return errSmapNoChange
 	}
 	if ctx.msg.Action == apc.ActRmNodeUnsafe && hasTarget {
-		if running, xid := p.notifs.isRebRunning(); running {
-			return fmt.Errorf("rebalance[%s] is currently running, please try (%s %v) later", xid, ctx.msg.Action, ctx.sids)
+		if err := p.notifs.errRebRunning(ctx.msg.Action + " " + strings.Join(ctx.sids, ", ")); err != nil {
+			return err
 		}
 	}
 	var removedProxy bool
@@ -680,10 +744,7 @@ func (p *proxy) _reqHealthSelected(nodes meta.Nodes, smap *smapX, tout time.Dura
 // +gen:payload apc.ActStopMaintenance={"action": "stop-maintenance", "value": {"sids": ["target_id1", "target_id2"]}}
 func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg) {
 	const tag = "stop-maintenance:"
-	var (
-		opts apc.ActValRmNode
-		smap = p.owner.smap.get()
-	)
+	var opts apc.ActValRmNode
 	if err := cos.MorphMarshal(msg.Value, &opts); err != nil {
 		p.writeErrf(w, r, cmn.FmtErrMorphUnmarshal, p.si, msg.Action, msg.Value, err)
 		return
@@ -693,11 +754,20 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 		p.writeErr(w, r, errN)
 		return
 	}
+
+	if err := p.beginMembership(msg.Action); err != nil {
+		p.writeErr(w, r, err)
+		return
+	}
+	defer p.endMembership()
+
 	var (
+		tsi         *meta.Snode
+		targetCount int
+		smap        = p.owner.smap.get()
 		nodes       = make(meta.Nodes, 0, len(sids))
 		selectedIDs = make([]string, 0, len(sids))
 		snames      = make([]string, 0, len(sids))
-		targetCount int
 	)
 	for _, sid := range sids {
 		si := smap.GetNode(sid)
@@ -722,6 +792,7 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 		selectedIDs = append(selectedIDs, si.ID())
 		if si.IsTarget() {
 			targetCount++
+			tsi = si
 		}
 		snames = append(snames, si.StringEx())
 	}
@@ -731,8 +802,9 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 	}
 
 	if targetCount > 0 {
-		if running, xid := p.notifs.isRebRunning(); running {
-			p.writeErrf(w, r, "rebalance[%s] is currently running, please try (%s %s) later", xid, msg.Action, snames)
+		// defensive: admission is held, but self-join is not gated
+		if err := p.notifs.errRebRunning(msg.Action + " " + strings.Join(snames, ", ")); err != nil {
+			p.writeErr(w, r, err)
 			return
 		}
 	}
@@ -799,7 +871,7 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 		}
 	}
 
-	rebID, err := p.mcastStopMaint(msg, selectedIDs, snames, reb)
+	rebID, err := p.mcastStopMaint(msg, selectedIDs, snames, tsi, reb)
 	if err != nil {
 		p.writeErr(w, r, err)
 		return
@@ -809,7 +881,7 @@ func (p *proxy) stopMaintenance(w http.ResponseWriter, r *http.Request, msg *apc
 	}
 }
 
-func (p *proxy) mcastStopMaint(msg *apc.ActMsg, sids, snames []string, reb bool) (rebID string, err error) {
+func (p *proxy) mcastStopMaint(msg *apc.ActMsg, sids, snames []string, tsi *meta.Snode, reb bool) (rebID string, err error) {
 	nlog.Infof("%s mcast-stopm: %s, %s, reb=%t", p, msg, snames, reb)
 	ctx := &smapModifier{
 		pre:     p._stopMaintPre,
@@ -820,15 +892,36 @@ func (p *proxy) mcastStopMaint(msg *apc.ActMsg, sids, snames []string, reb bool)
 		msg:     msg,
 		flags:   meta.SnodeMaint | meta.SnodeMaintPostReb, // to clear node flags
 	}
-	err = p.owner.smap.modify(ctx)
-	if err != nil && ctx.status != 0 {
-		err = cmn.NewErrFailedTo(p, msg.Action, snames, err, ctx.status)
+
+	if reb {
+		debug.Assert(tsi != nil)
+
+		smap := p.owner.smap.get()
+		if err := p._notifyEarlyGFN(ctx, smap, tsi); err != nil {
+			return "", err
+		}
 	}
+
+	err = p.owner.smap.modify(ctx)
+	if err != nil {
+		if ctx.status != 0 {
+			err = cmn.NewErrFailedTo(p, msg.Action, snames, err, ctx.status)
+		}
+		return "", err
+	}
+
 	if ctx.rmdCtx != nil && ctx.rmdCtx.cur != nil {
 		debug.Assert(ctx.rmdCtx.cur.version() > ctx.rmdCtx.prev.version() && ctx.rmdCtx.rebID != "")
-		rebID = ctx.rmdCtx.rebID
+		return ctx.rmdCtx.rebID, nil
 	}
-	return
+
+	if ctx.gfn { // stop timed GFN when no rebalance was started
+		actMsgExt := p.newAmsgActVal(apc.ActStopGFN, nil)
+		actMsgExt.UUID = tsi.ID()
+		revs := revsPair{&smapX{Smap: meta.Smap{Version: ctx.nver}}, actMsgExt}
+		_ = p.metasyncer.notify(false /*wait*/, revs) // async, failed-cnt always zero
+	}
+	return "", nil
 }
 
 func (p *proxy) _stopMaintPre(ctx *smapModifier, clone *smapX) error {
@@ -846,9 +939,8 @@ func (p *proxy) _stopMaintPre(ctx *smapModifier, clone *smapX) error {
 		hasTarget = hasTarget || si.IsTarget()
 	}
 	if hasTarget {
-		if running, xid := p.notifs.isRebRunning(); running {
-			return fmt.Errorf("rebalance[%s] is currently running, please try (%s %s) later",
-				xid, ctx.msg.Action, strings.Join(ctx.sids, ", "))
+		if err := p.notifs.errRebRunning(ctx.msg.Action + " " + strings.Join(ctx.sids, ", ")); err != nil {
+			return err
 		}
 	}
 	var activateProxy bool

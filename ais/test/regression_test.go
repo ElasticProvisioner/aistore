@@ -324,8 +324,9 @@ func TestReregisterMultipleTargets(t *testing.T) {
 		bytesRecv     int64
 
 		m = ioContext{
-			t:   t,
-			num: 10000,
+			t:             t,
+			num:           10000,
+			getErrIsFatal: true, // report the actual GET errors
 		}
 	)
 
@@ -341,30 +342,61 @@ func TestReregisterMultipleTargets(t *testing.T) {
 		bytesSentOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsOutObjSize)
 		bytesRecvOrig[targetID] = tools.GetNamedStatsVal(targetStats, cos.StreamsInObjSize)
 	}
+
 	proxyURL := tools.RandomProxyURL(t)
 	bp := tools.BaseAPIParams(proxyURL)
 
-	// Step 1: Unregister multiple targets
-	removed := make(map[string]*meta.Snode, m.smap.CountActiveTs()-1)
-	defer func() {
-		var rebID string
-		for _, tgt := range removed {
-			rebID = m.stopMaintenance(tgt)
-		}
-		tools.WaitForRebalanceByID(t, bp, rebID)
-	}()
-
-	targets := m.smap.Tmap.ActiveNodes()
-	for i := range targetsToUnregister {
-		tlog.Logfln("Put %s in maintenance (no rebalance)", targets[i].StringEx())
-		args := &apc.ActValRmNode{DaemonID: targets[i].ID(), SkipRebalance: true}
-		_, err := api.StartMaintenance(bp, args)
-		tassert.CheckFatal(t, err)
-		removed[targets[i].ID()] = targets[i]
+	var (
+		selected      = m.smap.Tmap.ActiveNodes()[:targetsToUnregister]
+		sids          = make([]string, 0, targetsToUnregister)
+		snames        = make([]string, 0, targetsToUnregister)
+		rebID         string
+		inMaintenance bool
+		getsRunning   bool
+	)
+	for _, tsi := range selected {
+		sids = append(sids, tsi.ID())
+		snames = append(snames, tsi.StringEx())
 	}
 
-	smap, err := tools.WaitForClusterState(proxyURL, "remove targets",
-		m.smap.Version, m.originalProxyCount, m.originalTargetCount-targetsToUnregister)
+	// Restore the cluster and stop background GETs on every failure path.
+	defer func() {
+		if getsRunning {
+			m.stopGets()
+		}
+		if inMaintenance {
+			tlog.Logfln("Cleanup: take %v out of maintenance", snames)
+			args := &apc.ActValRmNode{}
+			args.SetIDs(sids...)
+
+			id, err := api.StopMaintenance(bp, args)
+			tassert.CheckError(t, err)
+			rebID = id
+		}
+
+		// never leave a batch rebalance in flight - the next test's
+		// membership change would be rejected by the coexistence check
+		if rebID != "" {
+			tools.WaitForRebalanceByID(t, bp, rebID)
+		}
+	}()
+
+	// Step 1: Batch start-maintenance (no rebalance)
+	tlog.Logfln("Put %v in maintenance (no rebalance)", snames)
+	args := &apc.ActValRmNode{SkipRebalance: true}
+	args.SetIDs(sids...)
+
+	_, err := api.StartMaintenance(bp, args)
+	tassert.CheckFatal(t, err)
+	inMaintenance = true
+
+	smap, err := tools.WaitForClusterState(
+		proxyURL,
+		"remove targets",
+		m.smap.Version,
+		m.originalProxyCount,
+		m.originalTargetCount-targetsToUnregister,
+	)
 	tassert.CheckFatal(t, err)
 	tlog.Logfln("The cluster now has %d target(s)", smap.CountActiveTs())
 
@@ -373,24 +405,38 @@ func TestReregisterMultipleTargets(t *testing.T) {
 	m.puts()
 
 	// Step 3: Start performing GET requests
+	getsRunning = true
 	go m.getsUntilStop()
 
-	// Step 4: Simultaneously reregister each
-	wg := &sync.WaitGroup{}
-	for i := range targetsToUnregister {
-		wg.Add(1)
-		go func(r int) {
-			defer wg.Done()
-			m.stopMaintenance(targets[r])
-			delete(removed, targets[r].ID())
-		}(i)
-		time.Sleep(5 * time.Second) // wait some time before reregistering next target
-	}
-	wg.Wait()
+	// Step 4: Batch stop-maintenance (one rebalance)
+	tlog.Logfln("Bring %v out of maintenance (with rebalance)", snames)
+	args = &apc.ActValRmNode{}
+	args.SetIDs(sids...)
+
+	rebID, err = api.StopMaintenance(bp, args)
+	tassert.CheckFatal(t, err)
+
+	// The request was accepted and committed. Do not issue the same transition
+	// again from deferred cleanup if a later assertion fails - but `rebID` stays
+	// set so that cleanup still waits for the rebalance it started.
+	inMaintenance = false
+
+	smap, err = tools.WaitForClusterState(
+		proxyURL,
+		"stopping maintenance",
+		smap.Version,
+		m.originalProxyCount,
+		m.originalTargetCount,
+	)
+	tassert.CheckFatal(t, err)
+	tlog.Logfln("The cluster now has %d target(s)", smap.CountActiveTs())
+
 	tlog.Logfln("Stopping GETs...")
 	m.stopGets()
+	getsRunning = false
 
-	tools.WaitForRebalAndResil(t, bp)
+	tools.WaitForRebalanceByID(t, bp, rebID)
+	rebID = "" // drained
 
 	clusterStats = tools.GetClusterStats(t, m.proxyURL)
 	for targetID, targetStats := range clusterStats.Target {

@@ -60,7 +60,7 @@ func newMockTokenParser() *mockTokenParser {
 	}
 }
 
-func TestAuth_AccessHTRequiresToken(t *testing.T) {
+func TestAuth_AccessRequiresToken(t *testing.T) {
 	old := cmn.GCO.Get()
 	t.Cleanup(func() {
 		cmn.GCO.Put(old)
@@ -68,12 +68,12 @@ func TestAuth_AccessHTRequiresToken(t *testing.T) {
 	})
 
 	config := cmn.GCO.BeginUpdate()
-	config.Auth.Enabled = true
+	config.Auth.ClientAuthRequired = true
 	cmn.GCO.CommitUpdate(config)
 	cmn.Rom.Set(&config.ClusterConfig)
 
 	p := &proxy{htrun: htrun{statsT: mock.NewStatsTracker()}}
-	bck := meta.NewBck("example.com", apc.HT, cmn.NsGlobal)
+	bck := meta.NewBck("bucket", apc.AWS, cmn.NsGlobal)
 	req := &http.Request{Header: make(http.Header)}
 
 	err := p.access(req, bck, apc.AceGET)
@@ -116,6 +116,22 @@ func TestAuth_Manager_UpdateRevokedList_CleansExpiredTokens(t *testing.T) {
 	revoked := &tokenList{Tokens: []string{"expiredToken"}, Version: 1}
 	allRevoked := am.updateRevokedList(t.Context(), revoked)
 	tassert.Error(t, allRevoked == nil, "Expected allRevoked to be nil after cleanup of expired tokens")
+}
+
+// A caller cannot choose the revoked-list version, which would let it reject later updates
+func TestAuth_Manager_UpdateRevokedList_AssignsVersion(t *testing.T) {
+	am := &authManager{
+		tokenMap:      newShardedTokenMap(2),
+		revokedTokens: newRevokedTokensMap(),
+		tokenParser:   newMockTokenParser(),
+	}
+	version := am.revokedTokens.version
+
+	res := am.updateRevokedList(t.Context(), &tokenList{Tokens: []string{"tok1"}})
+
+	tassert.Fatal(t, res != nil, "Expect a non-nil result from revocation call")
+	tassert.Errorf(t, res.Version == version+1, "expected version %d, got %d", version+1, res.Version)
+	tassert.Error(t, am.revokedTokens.contains("tok1"), "expected 'tok1' to be revoked")
 }
 
 func TestAuth_Manager_RevokedTokenList(t *testing.T) {
