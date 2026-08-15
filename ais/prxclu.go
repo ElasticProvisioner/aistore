@@ -630,26 +630,24 @@ func (p *proxy) setCluCfgPersistent(w http.ResponseWriter, r *http.Request, toUp
 			}
 		}
 		if config.Auth.ClientAuthRequired != clientAuthRequired {
-			_warnUpd("config.auth.client_auth_required", strconv.FormatBool(config.Auth.ClientAuthRequired), strconv.FormatBool(clientAuthRequired))
+			_warnUpd("auth.client_auth_required", strconv.FormatBool(config.Auth.ClientAuthRequired), strconv.FormatBool(clientAuthRequired))
 		}
 	}
-	if toUpdate.Auth != nil && toUpdate.Auth.IntraCluster != nil &&
-		toUpdate.Auth.IntraCluster.RequestAuth != nil {
-		cur := config.Auth.IntraRequestAuthConfigured() // raw config bit (compare with SignVerifyEnabled() runtime)
-		upd := *toUpdate.Auth.IntraCluster.RequestAuth
-		if cmn.IsV50Bridge() {
-			if !cur && upd {
-				nlog.Warningln("intra-cluster auth (Ed25519 sign/verify) is a no-op on a v5.0 bridge release")
-			}
-		} else if cur != upd {
-			_warnUpd("config.auth.intra_cluster.request_auth", strconv.FormatBool(cur), strconv.FormatBool(upd))
+	if toUpdate.Auth != nil && toUpdate.Auth.IntraCluster != nil {
+		if upd := toUpdate.Auth.IntraCluster.RequestAuth; upd != nil {
+			_warnIntraUpd("auth.intra_cluster.request_auth", config.Auth.IntraRequestAuthConfigured(), *upd,
+				"Ed25519 sign/verify stays inactive on a v5.0 bridge release; proxy mediation takes effect now")
+		}
+		if upd := toUpdate.Auth.IntraCluster.NodeJoinSecretPath; upd != nil {
+			_warnIntraUpdVal("auth.intra_cluster.node_join_secret_path", config.Auth.NodeJoinSecretPath(), *upd,
+				"node-join authentication is a no-op on a v5.0 bridge release")
 		}
 	}
 	// 3. Tracing
 	if toUpdate.Tracing != nil {
 		from, _ := jsoniter.Marshal(config.Tracing)
 		to, _ := jsoniter.Marshal(toUpdate.Tracing)
-		_warnUpd("config.tracing", string(from), string(to))
+		_warnUpd("tracing", string(from), string(to))
 	}
 	// 4. config.Timeout section
 	if toUpdate.Timeout != nil {
@@ -726,6 +724,27 @@ func switchHTTPS(toCfg *cmn.ProxyConfToSet, fromCfg *cmn.ProxyConf, use bool) {
 	toCfg.DiscoveryURL = f(toCfg.DiscoveryURL, fromCfg.DiscoveryURL)
 
 	nlog.Errorln("Warning: _prior_ to restart make sure to remove all copies of cluster maps")
+}
+
+func _warnIntraUpd(knob string, cur, upd bool, v50note string) {
+	if cur || !upd { // only when enabling
+		v50note = ""
+	}
+	_warnIntra(knob, strconv.FormatBool(cur), strconv.FormatBool(upd), v50note)
+}
+
+func _warnIntraUpdVal(knob, cur, upd, v50note string) {
+	_warnIntra(knob, "'"+cur+"'", "'"+upd+"'", v50note)
+}
+
+func _warnIntra(knob, cur, upd, v50note string) {
+	if cur == upd {
+		return
+	}
+	_warnUpd(knob, cur, upd)
+	if v50note != "" && cmn.IsV50Bridge() {
+		nlog.Warningln(knob + ": " + v50note)
+	}
 }
 
 func _warnUpd(what, from, to string) {

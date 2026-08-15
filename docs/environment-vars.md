@@ -169,7 +169,7 @@ See also:
 | name | comment |
 | ---- | ------- |
 | `MY_POD` and `HOSTNAME` | Kubernetes POD name. `MY_POD` is used in [production](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go); `HOSTNAME`, on the other hand, is usually considered a Kubernetes default |
-| `MY_NODE` | Kubernetes node name |
+| `MY_NODE` | Kubernetes node name; injected via the downward API in both [production](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go) and development, and required in Kubernetes deployments - aisnode exits at startup when it is not set |
 | `K8S_NS` and `POD_NAMESPACE` | Kubernetes namespace. `K8S_NS` is used in [production](https://github.com/NVIDIA/ais-k8s/blob/main/operator/pkg/resources/cmn/env.go), while `POD_NAMESPACE` - development |
 
 Kubernetes POD name is also reported via `ais show cluster` CLI - when it is a Kubernetes deployment, e.g.:
@@ -304,7 +304,7 @@ auth.oidc.issuer_ca_bundle
 auth.oidc.jwks_cache.min_rotation_refresh        0s
 auth.oidc.jwks_cache.min_background_refresh      0s
 auth.intra_cluster.request_auth                  false ## (intra-cluster requests and redirects _not_ signed)
-auth.intra_cluster.self_join_auth                false ## (self-join authentication not required; no-op in v5.0)
+auth.intra_cluster.node_join_secret_path         ""    ## (node-join authentication not configured; no-op in v5.0)
 auth.intra_cluster.ttl                           0s
 auth.intra_cluster.nonce_window                  0s
 auth.intra_cluster.rotation_grace                0s

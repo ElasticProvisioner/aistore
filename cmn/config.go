@@ -836,18 +836,22 @@ type (
 	// CSK/HMAC; the v5.x replacement is per-node Ed25519 signing.
 	// TTL, NonceWindow, and RotationGrace define request validation windows.
 	IntraClusterConf struct {
-		RequestAuth   bool         `json:"request_auth"`
-		SelfJoinAuth  bool         `json:"self_join_auth"`
+		NodeJoinSecretPath string `json:"node_join_secret_path"`
+
+		// intra-cluster request signing and verification
 		TTL           cos.Duration `json:"ttl"`            // default: 0 (never expire)
 		NonceWindow   cos.Duration `json:"nonce_window"`   // max clock skew for timestamp validation, default: 1m
 		RotationGrace cos.Duration `json:"rotation_grace"` // accept old+new key during rotation, default: 1m
+		RequestAuth   bool         `json:"request_auth"`
 	}
 	IntraClusterConfToSet struct {
-		RequestAuth   *bool         `json:"request_auth,omitempty"`
-		SelfJoinAuth  *bool         `json:"self_join_auth,omitempty"`
+		NodeJoinSecretPath *string `json:"node_join_secret_path,omitempty"`
+
+		// ditto
 		TTL           *cos.Duration `json:"ttl,omitempty"`
 		NonceWindow   *cos.Duration `json:"nonce_window,omitempty"`
 		RotationGrace *cos.Duration `json:"rotation_grace,omitempty"`
+		RequestAuth   *bool         `json:"request_auth,omitempty"`
 	}
 
 	// keepalive
@@ -2493,19 +2497,36 @@ func (c *AuthConf) CopyTo(dst *AuthConf) {
 	}
 }
 
+// v5.0 is the bridge release between the v4.x symmetric CSK/HMAC mechanism and
+// v5.1+ per-node Ed25519 signing and node-join security.
+
 // TODO: [backward compatibility] remove in 5.1, along with all call sites
 func IsV50Bridge() bool { return strings.HasPrefix(VersionAIStore, "5.0") }
+
+// Two predicates, two distinct questions. Do not conflate:
+//   - IntraRequestAuthConfigured: what the operator asked for (raw config bit)
+//   - signVerifyEnabled:          what this binary will actually do
 
 func (c *AuthConf) IntraRequestAuthConfigured() bool {
 	return c.IntraCluster != nil && c.IntraCluster.RequestAuth
 }
 
-func (c *AuthConf) SignVerifyEnabled() bool {
+func (c *AuthConf) signVerifyEnabled() bool {
 	return c.IntraRequestAuthConfigured() && !IsV50Bridge()
+}
+
+// "" implies node-join authentication is not configured; the path is local to
+// each node and is therefore validated at node startup, not on config update
+func (c *AuthConf) NodeJoinSecretPath() string {
+	if c.IntraCluster == nil {
+		return ""
+	}
+	return c.IntraCluster.NodeJoinSecretPath
 }
 
 // Starting with v5.0, direct access to AIS targets is rejected when either AuthN
 // or intra-cluster request signing is configured: both require proxy mediation.
+// Note that auth.intra_cluster.node_join_secret_path is deliberately NOT part of this.
 func (c *AuthConf) RequiresProxyMediation() bool {
 	return c.ClientAuthRequired || c.IntraRequestAuthConfigured()
 }
@@ -3541,8 +3562,9 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	Rom.Set(&config.ClusterConfig)
 	Rom.testingEnv = config.TestingEnv()
 
+	// operator messaging (see IsV50Bridge)
 	if IsV50Bridge() && config.Auth.IntraRequestAuthConfigured() {
-		debug.Assert(!config.Auth.SignVerifyEnabled())
+		debug.Assert(!Rom.SignVerifyEnabled())
 		nlog.Warningln("auth.intra_cluster.request_auth: configured but disabled in v5.0 bridge")
 	}
 
