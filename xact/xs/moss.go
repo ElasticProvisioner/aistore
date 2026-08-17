@@ -71,7 +71,10 @@ import (
 // Per-request max-number-soft-errors and GFN are separately
 // configurable (https://github.com/NVIDIA/aistore/blob/main/docs/get_batch.md)
 // -----------------------------------------------------------------------
-// TODO: range read; throttle senders
+// TODO:
+// - throttle senders
+// - count successfully retrieved zero-size objects/files; current generic and
+//   per-WI counters use size > 0 to exclude missing header-only entries
 // -----------------------------------------------------------------------
 
 // hardcoded tunables
@@ -2055,6 +2058,10 @@ func (wi *basewi) flushRx() error {
 		switch {
 		case entry.mopaque.missing:
 			debug.Assert(strings.HasPrefix(entry.nameInArch, apc.MossMissingDir+"/"), entry.nameInArch)
+			err = wi.aw.Write(entry.nameInArch, cos.SimpleOAH{Size: 0}, nopROC{})
+		case entry.sgl == nil:
+			// zero-size objects are transmitted header-only
+			debug.Assert(entry.mopaque.emsg == "", entry.mopaque.emsg)
 			err = wi.aw.Write(entry.nameInArch, cos.SimpleOAH{Size: 0}, nopROC{})
 		default:
 			debug.Assert(entry.mopaque.emsg == "", entry.mopaque.emsg)
