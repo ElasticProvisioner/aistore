@@ -409,21 +409,29 @@ The following values are provided as convenient aliases for a list of permission
 
 ### Promote
 
-Promote grants cluster admins effective read access to any path visible to an AIS target, including network mounts.
+Every promote source must be named by an absolute path under the hard-coded
+`/var/lib/ais/promote` root on the target. A system administrator can place
+local files and directories there or mount a file share beneath the root.
+Symbolic links are not supported as promote sources.
 
-Because of this extended access, promote requires the `ADMIN` permission in addition to `PROMOTE`.
-The following table illustrates each permission boundary for promote access.
-Promote requires both checks to pass:
-- **bucket-scoped** `PROMOTE` — from the bucket ACL, or from the cluster ACL when there is no bucket entry
-- **cluster-scoped** `ADMIN`
+`PROMOTE` permits reading supported sources beneath this administrator-managed
+root. With `--delete-src`, it also permits deleting source files selected by the
+request. Use read-only mounts when deletion must not be possible, and do not
+allow untrusted local users to modify the root or create entries beneath it.
+
+The AIStore API does not create mounts. Regardless of AIStore role, an API
+request must name a path under `/var/lib/ais/promote`.
+
+AuthN requires a single `PROMOTE` check — from the bucket ACL, or from the cluster ACL when there is no bucket entry.
+`PROMOTE` is a standalone permission, granted separately from `rw`.
 
 | Principal                                             | Result                                        |
 |-------------------------------------------------------|-----------------------------------------------|
-| Superuser                                             | allowed — short-circuits both checks          |
-| Bucket ACL `PROMOTE`; Cluster ACL `ADMIN`             | allowed                                       |
-| No bucket ACL; Cluster ACL `ADMIN, PROMOTE`           | allowed                                       |
-| Bucket ACL without `PROMOTE`; Cluster ACL has `ADMIN` | **denied** by the bucket-scoped promote check |
-| Bucket ACL `PROMOTE` only                             | **denied** by the admin check                 |
+| Superuser                                             | allowed                                       |
+| Bucket ACL `PROMOTE`                                  | allowed                                       |
+| No bucket ACL; Cluster ACL includes `PROMOTE`         | allowed (cluster fall-through)                |
+| Bucket ACL without `PROMOTE`                          | **denied**                                    |
+| Named source path outside `/var/lib/ais/promote`      | **denied** (independent of ACL)               |
 
 ## How to Enable AuthN Server After Deployment
 

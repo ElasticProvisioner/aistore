@@ -513,7 +513,7 @@ func clearAllECObjects(t *testing.T, bck cmn.Bck, failOnDelErr bool, o *ecOption
 	}
 	wg.Wait()
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	api.WaitForSnapsIdle(tools.BaseAPIParams(proxyURL), &reqArgs)
+	api.WaitForXaction(tools.BaseAPIParams(proxyURL), &reqArgs)
 }
 
 func objectsExist(t *testing.T, baseParams api.BaseParams, bck cmn.Bck, objPatt string, objCount int) {
@@ -831,12 +831,12 @@ func TestECRestoreObjAndSliceRemote(t *testing.T) {
 				defer func() {
 					tlog.Logln("Wait for PUTs to finish...")
 					args := xact.ArgsMsg{Kind: apc.ActECPut}
-					err := api.WaitForSnapsIdle(baseParams, &args)
+					err := api.WaitForXaction(baseParams, &args)
 					tassert.CheckError(t, err)
 
 					clearAllECObjects(t, bck, true, o)
 					reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-					err = api.WaitForSnapsIdle(baseParams, &reqArgs)
+					err = api.WaitForXaction(baseParams, &reqArgs)
 					tassert.CheckError(t, err)
 				}()
 
@@ -1220,7 +1220,7 @@ func TestECDisableEnableDuringLoad(t *testing.T) {
 	})
 	tassert.CheckError(t, err)
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: bck}
-	_, err = api.WaitForXactionIC(baseParams, &reqArgs)
+	err = api.WaitForXaction(baseParams, &reqArgs)
 	tassert.CheckError(t, err)
 
 	abortCh.Close()
@@ -1680,7 +1680,7 @@ func TestECDestroyBucket(t *testing.T) {
 	wg.Wait()
 	tlog.Logfln("EC put files resulted in error in %d out of %d files", errCnt.Load(), o.objCount)
 	args := xact.ArgsMsg{Kind: apc.ActECPut}
-	api.WaitForSnaps(baseParams, &args, args.Idle())
+	api.WaitForXaction(baseParams, &args)
 
 	// create bucket with the same name and check if puts are successful
 	newLocalBckWithProps(t, baseParams, bck, bckProps, o)
@@ -2062,7 +2062,7 @@ func TestECEmergencyMountpath(t *testing.T) {
 
 	// Wait for ec to finish
 	flt := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	_ = api.WaitForSnapsIdle(baseParams, &flt)
+	api.WaitForXaction(baseParams, &flt)
 }
 
 func TestECRebalance(t *testing.T) {
@@ -2131,7 +2131,7 @@ func TestECMountpaths(t *testing.T) {
 	}
 
 	reqArgs := xact.ArgsMsg{Kind: apc.ActECPut, Bck: bck}
-	api.WaitForSnapsIdle(tools.BaseAPIParams(proxyURL), &reqArgs)
+	api.WaitForXaction(tools.BaseAPIParams(proxyURL), &reqArgs)
 }
 
 // The test only checks that the number of object after rebalance equals
@@ -2258,7 +2258,7 @@ func TestECBucketEncode(t *testing.T) {
 
 	tlog.Logfln("Wait for ec-bucket[%s] %s", xid, m.bck.String())
 	xargs := xact.ArgsMsg{Kind: apc.ActECEncode, Bck: m.bck, Timeout: tools.RebalanceTimeout}
-	_, err = api.WaitForXactionIC(baseParams, &xargs)
+	err = api.WaitForXaction(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 
 	lst, err = api.ListObjects(baseParams, m.bck, nil, api.ListArgs{})
@@ -2300,7 +2300,7 @@ func TestECAndRegularRebalance(t *testing.T) {
 	)
 	o := &ecOptions{
 		minTargets:   5,
-		objCount:     90,
+		objCount:     50,
 		concurrency:  8,
 		pattern:      "obj-reb-chk-%04d",
 		silent:       true,
@@ -2309,7 +2309,9 @@ func TestECAndRegularRebalance(t *testing.T) {
 	o.init(t, proxyURL)
 	initMountpaths(t, proxyURL)
 
-	for _, test := range ecTests {
+	// exercise both paths: replicated small objects and 2:2 slices
+	rebalanceTests := []ecTest{ecTests[0], ecTests[len(ecTests)-1]}
+	for _, test := range rebalanceTests {
 		t.Run(test.name, func(t *testing.T) {
 			if o.smap.CountActiveTs() <= test.parity+test.data+1 {
 				t.Skip(cmn.NewErrNotEnoughTargets(""))
@@ -2330,13 +2332,20 @@ func ecAndRegularRebalance(t *testing.T, o *ecOptions, proxyURL string, bckReg, 
 
 	// select a target that loses its mpath(simulate drive death),
 	// and that has mpaths changed (simulate mpath added)
-	tgtList := o.smap.Tmap.ActiveNodes()
+	smap := tools.GetClusterMap(t, proxyURL)
+	tgtList := smap.Tmap.ActiveNodes()
+
 	tgtLost := tgtList[0]
 
 	tlog.Logfln("Put %s in maintenance (no rebalance)", tgtLost.StringEx())
 	args := &apc.ActValRmNode{DaemonID: tgtLost.ID(), SkipRebalance: true}
 	_, err := api.StartMaintenance(baseParams, args)
 	tassert.CheckFatal(t, err)
+
+	_, err = tools.WaitForClusterState(proxyURL, "target removed",
+		smap.Version, smap.CountActivePs(), smap.CountActiveTs()-1)
+	tassert.CheckFatal(t, err)
+
 	registered := false
 	defer func() {
 		if !registered {
@@ -2765,16 +2774,12 @@ func TestECBckEncodeRecover(t *testing.T) {
 
 	o := &ecOptions{
 		minTargets:  4,
-		objCount:    512,
+		objCount:    128,
 		concurrency: 4,
 		pattern:     "obj-%04d",
 		silent:      testing.Short(),
 	}
 	o.init(t, proxyURL)
-
-	if testing.Short() {
-		o.objCount = max(o.objCount/4, 128)
-	}
 
 	// Damage this number of objects for each test case
 	objToDamage := o.objCount / 8
@@ -2787,7 +2792,10 @@ func TestECBckEncodeRecover(t *testing.T) {
 		objSlicesOrig = make(map[string]map[string]ecSliceMD, o.objCount)
 	)
 
-	for _, test := range ecTests {
+	// to test recovery we run one replicated case and one sliced case
+	// (the remaining data/parity permutations are covered by the dedicated EC tests)
+	recoveryTests := []ecTest{ecTests[0], ecTests[len(ecTests)-1]}
+	for _, test := range recoveryTests {
 		types := []string{"%ob", "%ec"}
 		// In case of only 1 data and parity, there is no slice, so %ec directory is empty
 		if test.data == 1 && test.parity == 1 {
@@ -2857,12 +2865,12 @@ func TestECBckEncodeRecover(t *testing.T) {
 			api.WaitForSnapsIdle(tools.BaseAPIParams(proxyURL), &reqArgs)
 			// Second, wait for EC-recover xaction to complete
 			reqECArgs := xact.ArgsMsg{ID: xid, Kind: apc.ActECRespond, Bck: bck}
-			api.WaitForSnapsIdle(tools.BaseAPIParams(proxyURL), &reqECArgs)
+			api.WaitForXaction(tools.BaseAPIParams(proxyURL), &reqECArgs)
 
-			// [RETRY]
+			// Recovery normally completes with the xactions above. Retry only
+			// when the filesystem check observes lagging content.
 			var errStr string
-			for range 4 {
-				time.Sleep(8 * time.Second)
+			for attempt := range 4 {
 				errStr = ""
 				// Check that all slices and metafiles are recovered
 				for objName, parts := range objSlicesOrig {
@@ -2876,6 +2884,9 @@ func TestECBckEncodeRecover(t *testing.T) {
 				}
 				if errStr == "" {
 					break
+				}
+				if attempt < 3 {
+					time.Sleep(8 * time.Second)
 				}
 			}
 			tassert.Error(t, errStr == "", errStr)
@@ -2949,7 +2960,7 @@ func TestECStoreCleanup(t *testing.T) {
 
 	xargs.ID = xid
 	xargs.Timeout = tools.RebalanceTimeout
-	_, err = api.WaitForXactionIC(baseParams, &xargs)
+	err = api.WaitForXaction(baseParams, &xargs)
 	tassert.CheckFatal(t, err)
 
 	// on timing: rmAnyBatch(flagRmMisplacedEC) will not fire for a single

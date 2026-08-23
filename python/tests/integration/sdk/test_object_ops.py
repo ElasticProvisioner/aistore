@@ -9,7 +9,6 @@ import unittest
 import io
 import tarfile
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import pytest
 import xxhash
 
@@ -36,8 +35,10 @@ from tests.const import (
 from tests.integration.sdk.parallel_test_base import ParallelTestBase
 from tests.utils import (
     cases,
+    cleanup_local,
     create_archive,
     direct_target_access_allowed,
+    promote_test_dir,
     string_to_dict,
     has_targets,
     random_string,
@@ -258,15 +259,16 @@ class TestObjectOps(ParallelTestBase):
     # pylint: disable=too-many-locals
     def test_promote(self):
         self.bucket = self._create_bucket()
-        top_folder = self.local_test_files.joinpath("promote_folder")
         top_item = "test_file_top"
         top_item_contents = "contents in the test file"
         inner_folder_name = "inner_folder/"
         inner_item = "test_file_inner"
         inner_item_contents = "contents of the file in the inner folder"
 
-        # Create a folder in the current directory
-        local_files_path = Path().absolute().joinpath(top_folder)
+        # promote only accepts sources under the promote root
+        promote_dir = promote_test_dir()
+        self.addCleanup(cleanup_local, str(promote_dir))
+        local_files_path = promote_dir.joinpath("promote_folder")
         local_files_path.mkdir()
         with open(
             local_files_path.joinpath(top_item), "w", encoding=UTF_ENCODING
@@ -325,11 +327,7 @@ class TestObjectOps(ParallelTestBase):
         ).get_reader()
         self.assertEqual(inner_item_contents, inner_obj.read_all().decode(UTF_ENCODING))
         # Check source deleted
-        top_level_files = [
-            f
-            for f in Path(top_folder).glob("*")
-            if Path(top_folder).joinpath(f).is_file()
-        ]
+        top_level_files = [f for f in local_files_path.glob("*") if f.is_file()]
         self.assertEqual(0, len(top_level_files))
         self.assertEqual(0, len(list(inner_folder.glob("*"))))
 
@@ -361,9 +359,7 @@ class TestObjectOps(ParallelTestBase):
 
         blob_download_job_id = obj.blob_download()
         self.assertNotEqual(blob_download_job_id, "")
-        result = self.client.job(job_id=blob_download_job_id).wait_single_node(
-            timeout=TEST_TIMEOUT
-        )
+        result = self.client.job(job_id=blob_download_job_id).wait(timeout=TEST_TIMEOUT)
         self.assertTrue(result.success)
         self.assertTrue(obj.props.present)
 

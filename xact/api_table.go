@@ -178,7 +178,8 @@ var Table = map[string]Descriptor{
 		AbortByReb:     true,
 	},
 
-	apc.ActBlobDl: {Access: apc.AccessRW, Scope: ScopeB, Startable: true, AbortByReb: true, RefreshCap: true, ICMode: ICUponTerm},
+	// Direct-target start paths do not register an IC listener; wait via target snaps.
+	apc.ActBlobDl: {Access: apc.AccessRW, Scope: ScopeB, Startable: true, AbortByReb: true, RefreshCap: true},
 
 	// target pushes periodic progress (tgtdl.go); also finalizes on term
 	apc.ActDownload: {Access: apc.AccessRW, Scope: ScopeG, Startable: false, Idles: true, AbortByReb: true, ICMode: ICUponTerm | ICUponProgress},
@@ -356,7 +357,10 @@ func GetSimilar(kindOrName string) (simKind, simName string) {
 
 func IdlesBeforeFinishing(kindOrName string) bool {
 	_, dtor := getDtor(kindOrName)
-	debug.Assert(dtor != nil)
+	debug.Assert(dtor != nil, kindOrName)
+	if dtor == nil {
+		return false
+	}
 	return dtor.Idles
 }
 
@@ -387,6 +391,9 @@ func IsSameScope(kindOrName string, scs ...int) bool {
 }
 
 func getDtor(kindOrName string) (string, *Descriptor) {
+	if kindOrName == "" {
+		return "", nil
+	}
 	if dtor, ok := Table[kindOrName]; ok {
 		return kindOrName, &dtor
 	}

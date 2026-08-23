@@ -41,8 +41,9 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 - **BREAKING**: AuthN cluster registration now verifies AIStore TLS
   certificates by default. Deployments using untrusted certificates must
   configure `ca_cert` or explicitly set `skip_verify=True`.
-- **BREAKING**: `ACCESS_RW` no longer includes `PROMOTE`. Promote now additionally
-  requires `ADMIN`; grant `PROMOTE | ADMIN` (or `ACCESS_SU`).
+- **BREAKING**: `ACCESS_RW` no longer includes `PROMOTE`. Grant `PROMOTE`
+  explicitly (or `ACCESS_SU`). Promote sources are restricted to
+  `/var/lib/ais/promote`; symbolic links are not supported.
 - ETL pod spec templates no longer list the obsolete `io://` communication type.
 - Deprecated `Etl.init_spec()` with a `FutureWarning`; use `Etl.init()` or
   `Etl.init_class()` instead. Pod spec initialization will be removed in v5.1.
@@ -50,8 +51,8 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
   `api.WaitForXaction`: when `job_kind` is an idle kind (e.g. `download`,
   `get-batch`, `copy-listrange`, `etl-listrange`, `archive`, `list`,
   `put-copies`, `ec-get`/`ec-put`/`ec-resp`) it waits for cluster-wide idle;
-  otherwise — including
-  empty or unknown kinds — it waits for terminal state (preserving the
+  blob downloads wait for terminal target snapshots; otherwise — including
+  empty or unknown kinds — it waits for terminal IC status (preserving the
   pre-convergence behavior). `wait_for_idle` and `wait_single_node` remain
   available as explicit overrides.
 - `Job.wait()` resolves the job kind from the cluster when only a job id is
@@ -60,6 +61,9 @@ We structure this changelog in accordance with [Keep a Changelog](https://keepac
 - `Job.wait()` / `wait_for_idle()` require an idle-kind job to report idle on
   2 consecutive polls before completing (mirrors Go's
   `xact.numConsecutiveIdle`); an abort on any target still returns immediately.
+- `Batch.get()` uses a shallow copy instead of deep copy when snapshotting the 
+  request before clearing, making the snapshot O(1) regardless of batch size.
+  - `MossIn` is now a frozen Pydantic class, reflecting its immutability.
 
 ### Fixed
 

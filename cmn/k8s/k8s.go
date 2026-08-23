@@ -24,10 +24,7 @@ type PodStatus struct {
 	ExitCode int32
 }
 
-const (
-	defaultPodNameEnv   = "HOSTNAME"
-	defaultNamespaceEnv = "POD_NAMESPACE"
-)
+const defaultPodNameEnv = "HOSTNAME"
 
 const (
 	Default = "default"
@@ -35,7 +32,10 @@ const (
 	Svc     = "svc"
 )
 
-const nonK8s = "non-Kubernetes deployment"
+const (
+	nonK8s        = "non-Kubernetes deployment"
+	missingK8sEnv = "K8s environment variable not found"
+)
 
 var (
 	NodeName string // assign upon successful initialization
@@ -44,29 +44,38 @@ var (
 )
 
 func Init() {
-	_initClient()
-	if _, err := GetClient(); err != nil {
-		nlog.Infoln(nonK8s, "(init k8s-client returned: '"+_short(err)+"')")
+	if err := _initClient(); err != nil {
+		// Non-K8s deployment
+		if softNonK8s(err) {
+			nlog.Infoln(nonK8s, "(init k8s-client returned: '"+_short(err)+"')")
+			return
+		}
+		cos.ExitLogf("k8s client initialization failed: %v", err)
 		return
 	}
-	podName := _podName()
+	if err := _initInCluster(); err != nil {
+		cos.ExitLog(err)
+	}
+}
+
+// in-cluster: both the node name and the pod name are required
+// (separated out from Init to be unit-testable without a cluster)
+func _initInCluster() error {
+	nodeName := os.Getenv(env.AisK8sNode)
+	if nodeName == "" {
+		return fmt.Errorf("%s: %q", missingK8sEnv, env.AisK8sNode)
+	}
+	podName := resolvePodName()
 	if podName == "" {
-		nlog.Infof("Env %q is not set => %s", env.AisK8sPod, nonK8s)
-		return
+		return fmt.Errorf("%s: %q (or %q)", missingK8sEnv, env.AisK8sPod, defaultPodNameEnv)
 	}
-	_initNode()
-	nlog.Infoln("Pod info:", "name", podName, ",namespace", _namespace(), ",node", NodeName)
+	nlog.Infof("Pod info: name: %q, namespace: %q, node: %q", podName, _clientNamespace(), nodeName)
+
+	NodeName = nodeName // last: IsK8s() implies an initialized client
+	return nil
 }
 
-// Resolve this node's name from the environment.
-func _initNode() {
-	if NodeName = os.Getenv(env.AisK8sNode); NodeName == "" {
-		cos.ExitLogf("Failed to get K8s node name: env %q is not set", env.AisK8sNode)
-	}
-}
-
-// Resolve this pod's name from the environment (empty when not in a pod).
-func _podName() string {
+func resolvePodName() string {
 	podName := os.Getenv(env.AisK8sPod)
 	if podName == "" {
 		return os.Getenv(defaultPodNameEnv)

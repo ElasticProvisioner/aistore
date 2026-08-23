@@ -8,6 +8,8 @@ import (
 	"fmt"
 	iofs "io/fs"
 	"math/rand/v2"
+	"net/http"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,7 @@ import (
 
 	"github.com/NVIDIA/aistore/api"
 	"github.com/NVIDIA/aistore/api/apc"
+	"github.com/NVIDIA/aistore/cmn"
 	"github.com/NVIDIA/aistore/cmn/cos"
 	"github.com/NVIDIA/aistore/core/meta"
 	"github.com/NVIDIA/aistore/tools"
@@ -39,18 +42,19 @@ type prmTests struct {
 
 // flow: TestPromote (tests) => runProvider x (provider tests) => test.do(bck)
 func TestPromote(t *testing.T) {
+	const many = 1000
 	tests := []prmTests{
 		// short and long
-		{num: 10000, singleTarget: false, recurs: false, deleteSrc: false, overwriteDst: false, notFshare: false},
-		{num: 10000, singleTarget: false, recurs: true, deleteSrc: true, overwriteDst: false, notFshare: false},
+		{num: many, singleTarget: false, recurs: false, deleteSrc: false, overwriteDst: false, notFshare: false},
+		{num: many, singleTarget: false, recurs: true, deleteSrc: true, overwriteDst: false, notFshare: false},
 		{num: 10, singleTarget: false, recurs: false, deleteSrc: true, overwriteDst: true, notFshare: false},
 		// long
-		{num: 10000, singleTarget: true, recurs: false, deleteSrc: false, overwriteDst: false, notFshare: false},
-		{num: 10000, singleTarget: true, recurs: true, deleteSrc: false, overwriteDst: true, notFshare: false},
+		{num: many, singleTarget: true, recurs: false, deleteSrc: false, overwriteDst: false, notFshare: false},
+		{num: many, singleTarget: true, recurs: true, deleteSrc: false, overwriteDst: true, notFshare: false},
 		{num: 10, singleTarget: true, recurs: false, deleteSrc: false, overwriteDst: false, notFshare: false},
 		{num: 10, singleTarget: false, recurs: true, deleteSrc: false, overwriteDst: false, notFshare: false},
-		{num: 10000, singleTarget: false, recurs: true, deleteSrc: true, overwriteDst: false, notFshare: true},
-		{num: 10000, singleTarget: true, recurs: true, deleteSrc: false, overwriteDst: true, notFshare: true},
+		{num: many, singleTarget: false, recurs: true, deleteSrc: true, overwriteDst: false, notFshare: true},
+		{num: many, singleTarget: true, recurs: true, deleteSrc: false, overwriteDst: true, notFshare: true},
 		{num: 10, singleTarget: false, recurs: true, deleteSrc: false, overwriteDst: false, notFshare: true},
 	}
 	// see also "filtering" below
@@ -88,6 +92,49 @@ func TestPromote(t *testing.T) {
 		name = name[1:]
 		t.Run(name, func(t *testing.T) { runProviderTests(t, test.do) })
 	}
+}
+
+func TestPromoteRejectsConflictingSource(t *testing.T) {
+	var (
+		proxyURL = tools.RandomProxyURL(t)
+		bp       = tools.BaseAPIParams(proxyURL)
+		bck      = cmn.Bck{Name: "promote-conflict-" + cos.GenUUID(), Provider: apc.AIS}
+		inside   = filepath.Join(apc.PromoteRoot, "inside")
+		outside  = filepath.Join(t.TempDir(), "outside")
+	)
+	tools.CreateBucket(t, proxyURL, bck, nil, true /*cleanup*/)
+
+	tests := []struct {
+		name string
+		src  string
+	}{
+		{name: inside, src: outside},
+		{name: outside, src: inside},
+	}
+	for _, test := range tests {
+		msg := &apc.ActMsg{
+			Action: apc.ActPromote,
+			Name:   test.name,
+			Value:  &apc.PromoteArgs{SrcFQN: test.src},
+		}
+		err := rawPromote(bp, bck, msg)
+		expectStatus(t, err, http.StatusBadRequest)
+	}
+}
+
+func rawPromote(bp api.BaseParams, bck cmn.Bck, msg *apc.ActMsg) error {
+	q := url.Values{}
+	bck.SetQuery(q)
+	bp.Method = http.MethodPost
+	req := api.AllocRp()
+	req.BaseParams = bp
+	req.Path = apc.URLPathObjects.Join(bck.Name)
+	req.Query = q
+	req.Header = http.Header{cos.HdrContentType: []string{cos.ContentJSON}}
+	req.Body = cos.MustMarshal(msg)
+	err := req.DoRequest()
+	api.FreeRp(req)
+	return err
 }
 
 // generate ngen files in tempdir and tempdir/subdir, respectively
@@ -128,7 +175,7 @@ func (test *prmTests) do(t *testing.T, bck *meta.Bck) {
 	)
 	m.saveCluState(m.proxyURL)
 
-	tempdir := t.TempDir()
+	tempdir := promoteTestDir(t)
 	subdirFQN := filepath.Join(tempdir, subdir)
 	err := cos.CreateDir(subdirFQN)
 	tassert.CheckFatal(t, err)

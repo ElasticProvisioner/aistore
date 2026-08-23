@@ -78,6 +78,7 @@ type htrun struct {
 	// sign/verify
 	nodeKeyPair *cos.NodeKeyPair
 	svs         svState
+	joinSecret  []byte // node-join shared secret; loaded once by initPhase2; TODO: support explicit runtime reload
 
 	keepalive keepaliver
 	statsT    stats.Tracker
@@ -473,6 +474,12 @@ func mustDiffer(ip1 meta.NetInfo, port1 int, use1 bool, ip2 meta.NetInfo, port2 
 // - housekeep: memsys; rate-limit-prune
 func (h *htrun) initPhase2(config *cmn.Config) {
 	debug.Assert(g.netServ.control != nil && g.netServ.data != nil && g.netServ.pub != nil) // (phase1 above)
+	if secretPath := config.Auth.NodeJoinSecretPath(); !cmn.IsV50Bridge() && secretPath != "" {
+		var err error
+		if h.joinSecret, err = loadNodeJoinSecret(secretPath); err != nil {
+			cos.ExitLog(err)
+		}
+	}
 
 	// before newTLS() below & before intra-cluster clients
 	if config.Net.HTTP.UseHTTPS {
@@ -1229,6 +1236,24 @@ func (h *htrun) writeMsgPack(w http.ResponseWriter, v msgp.Encodable, tag string
 
 func (h *htrun) writeJSON(w http.ResponseWriter, r *http.Request, v any, tag string) {
 	if err := _writejs(w, r, v); err != nil {
+		h.logerr(tag, v, err)
+	}
+}
+
+func (h *htrun) writeJoinJSON(w http.ResponseWriter, r *http.Request, v any, tag, domain string) {
+	if len(h.joinSecret) == 0 {
+		h.writeJSON(w, r, v, tag)
+		return
+	}
+	body, err := jsoniter.Marshal(v)
+	if err == nil {
+		hdr := w.Header()
+		hdr.Set(cos.HdrContentType, cos.ContentJSONCharsetUTF)
+		hdr.Set(cos.HdrContentLength, strconv.Itoa(len(body)))
+		signNodeJoin(domain, h.joinSecret, body, hdr)
+		_, err = w.Write(body)
+	}
+	if err != nil {
 		h.logerr(tag, v, err)
 	}
 }
@@ -2253,6 +2278,7 @@ func (h *htrun) join(htext htext, contactURLs []string) (*callResult, error) {
 				resPrev = nil //nolint:ineffassign,wastedassign // readability
 			}
 			res = h.regTo(candidateURL, nil, apc.DefaultTimeout, htext, false /*keepalive*/)
+			h.verifyJoinResponse(res, config)
 			if res.err == nil {
 				if candidateURL == primaryURL || (psi != nil && candidateURL == psi.URL(cmn.NetPublic)) {
 					nlog.Infoln(h.String()+": primary responded Ok via", candidateURL)
@@ -2291,6 +2317,7 @@ func (h *htrun) join(htext htext, contactURLs []string) (*callResult, error) {
 	}
 
 	res = h.regTo(primaryURL, nil, apc.DefaultTimeout, htext, false /*keepalive*/)
+	h.verifyJoinResponse(res, config)
 	if res.err == nil {
 		nlog.Infoln(h.String()+": joined cluster via", primaryURL)
 		return res, nil
@@ -2333,6 +2360,16 @@ func _isLocalhost(h string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// authenticate the responding node (primary or candidate) before accepting its cluster metadata;
+// no-op when the node-join secret is not configured
+func (h *htrun) verifyJoinResponse(res *callResult, config *cmn.Config) {
+	if res.err != nil || len(h.joinSecret) == 0 {
+		return
+	}
+	maxSkew := config.Auth.NodeJoinNonceWindow()
+	res.err = verifyNodeJoin(nodeJoinResponseHMACDomain, h.joinSecret, res.bytes, res.header, maxSkew)
+}
+
 func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, htext htext, keepalive bool) *callResult {
 	var (
 		path          string
@@ -2367,6 +2404,14 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, htext hte
 	} else {
 		path = apc.URLPathCluAutoReg.S
 	}
+	body := cos.MustMarshal(cm)
+	header := http.Header{apc.HdrNodeVersion: []string{cmn.VersionAIStore}} // primary may want to enforce min-version or same-version
+
+	// Self-join, force-join registration, and slow keepalive require request authentication when configured.
+	if len(h.joinSecret) > 0 {
+		signNodeJoin(nodeJoinRequestHMACDomain, h.joinSecret, body, header)
+	}
+
 	cargs := allocCargs()
 	{
 		cargs.si = psi
@@ -2374,10 +2419,8 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, htext hte
 			Method: http.MethodPost,
 			Base:   url,
 			Path:   path,
-			Body:   cos.MustMarshal(cm),
-			Header: http.Header{
-				apc.HdrNodeVersion: []string{cmn.VersionAIStore}, // primary may want to enforce min-version or same-version
-			},
+			Body:   body,
+			Header: header,
 		}
 		cargs.timeout = tout
 	}
@@ -2430,6 +2473,7 @@ func (h *htrun) slowKalive(smap *smapX, htext htext, timeout time.Duration) (str
 	pid, primaryURL, psi := h._primus(smap, nil)
 
 	res := h.regTo(primaryURL, psi, timeout, htext, true /*keepalive*/)
+	// Note: slow keepalive does not consume response metadata; no response authentication is required
 	if res.err == nil {
 		freeCR(res)
 		return pid, 0, nil
@@ -2453,6 +2497,7 @@ func (h *htrun) slowKalive(smap *smapX, htext htext, timeout time.Duration) (str
 
 		freeCR(res)
 		res = h.regTo(primaryURL, psi, timeout, htext, true /*keepalive*/)
+		// Note: slow keepalive does not consume response metadata; no response authentication is required
 	}
 
 	status, err := res.status, res.err

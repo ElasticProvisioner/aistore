@@ -1,11 +1,12 @@
 // Package k8s: initialization, client, and misc. helpers
 /*
- * Copyright (c) 2018-2025, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2018-2026, NVIDIA CORPORATION. All rights reserved.
  */
 package k8s
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -46,30 +47,38 @@ type (
 		client    kubernetes.Interface
 		config    *rest.Config
 		namespace string
-		err       error
 	}
 )
 
 var (
 	_defaultK8sClient *defaultClient
+
+	// Returned by GetClient when the client was never set. A hard init failure exits
+	// the process (see Init), so reaching this means: not in a cluster.
+	errClientNotInit = errors.New("k8s client is not initialized (" + nonK8s + "?)")
 )
 
-func _initClient() {
+func _initClient() error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		_defaultK8sClient = &defaultClient{err: err}
-		return
+		return err
 	}
 	client, err := kubernetes.NewForConfig(config)
 	if err != nil {
-		_defaultK8sClient = &defaultClient{err: err}
-		return
+		return err
 	}
 	_defaultK8sClient = &defaultClient{
 		namespace: _namespace(),
 		client:    client,
 		config:    config,
 	}
+	return nil
+}
+
+// return true when client init failed because we are not in a cluster
+// (any other init error is a cos.Exit)
+func softNonK8s(err error) bool {
+	return errors.Is(err, rest.ErrNotInCluster)
 }
 
 // Retrieve pod namespace
@@ -79,28 +88,28 @@ func _initClient() {
 func _namespace() (namespace string) {
 	// production
 	if namespace = os.Getenv(env.AisK8sNamespace); namespace != "" {
-		debug.Func(func() {
-			ns := os.Getenv(defaultNamespaceEnv)
-			debug.Assertf(ns == "" || ns == namespace, "%q vs %q", ns, namespace)
-		})
 		return
 	}
-	// otherwise, try default env var
-	if namespace = os.Getenv(defaultNamespaceEnv); namespace != "" {
-		return
-	}
-	// finally, last resort kludge
+	// parse from service account
 	if ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
 		if namespace = strings.TrimSpace(string(ns)); namespace != "" {
 			return
 		}
 	}
-	return "default"
+	return Default
+}
+
+// namespace the initialized client is actually using (empty when not initialized)
+func _clientNamespace() string {
+	if _defaultK8sClient == nil {
+		return ""
+	}
+	return _defaultK8sClient.namespace
 }
 
 func GetClient() (Client, error) {
-	if _defaultK8sClient.err != nil {
-		return nil, _defaultK8sClient.err
+	if _defaultK8sClient == nil {
+		return nil, errClientNotInit
 	}
 	return _defaultK8sClient, nil
 }
@@ -241,7 +250,7 @@ func InitTestClient(namespace ...string) (Client, error) {
 	ns := "default"
 	if len(namespace) > 0 && namespace[0] != "" {
 		ns = namespace[0]
-	} else if envNs := os.Getenv("KUBERNETES_NAMESPACE"); envNs != "" {
+	} else if envNs := os.Getenv("KUBERNETES_NAMESPACE"); envNs != "" { // TODO: undocumented env var, usage unclear
 		ns = envNs
 	}
 

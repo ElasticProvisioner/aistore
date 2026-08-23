@@ -18,6 +18,8 @@ import (
 	"github.com/NVIDIA/aistore/cmn/mono"
 	"github.com/NVIDIA/aistore/cmn/nlog"
 	"github.com/NVIDIA/aistore/core/meta"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
 // This source handles POST /v1/cluster/{operation}: admin-join, self-join, and slow keepalive.
@@ -25,35 +27,36 @@ import (
 // The handler is structured as a small sequential state machine carried by the `clupost` context.
 // Phases are ordered:
 //
-// decode -> validate -> handshake -> resume-reb -> version -> admit -> dispatch
+// decode -> pre-authenticate -> validate -> handshake -> resume-reb -> version -> admit -> dispatch
 //
 // Rules:
 // - fast keepalive returns before `clupost` is created;
+// - when configured, explicit self-joins and restarted keepalives are authenticated (see docs/auth_node_join.md);
 // - validation resolves node flags and the action for the current operation;
 // - resumeReb may promote a restarted keepalive to self-join and update cluster action message;
 // - _joinKalive runs under the Smap lock and decides whether Smap mutation is needed;
 // - dispatch performs externally visible responses and metasync/rebalance work.
 
 type clupost struct {
-	p *proxy
-	w http.ResponseWriter
-	r *http.Request
-
+	p      *proxy
+	w      http.ResponseWriter
+	r      *http.Request
 	smap   *smapX
 	config *cmn.Config
-
-	nsi *meta.Snode
-	msg *apc.ActMsg
+	nsi    *meta.Snode
+	msg    *apc.ActMsg
 
 	regReq cluMeta
+	body   []byte // exact request bytes retained for admission authentication
 
 	apiOp  string // handler path: version check, dispatch response, admission mode
 	action string // cluster action message (apc.ActMsg) semantics
 
-	nversStr    string
-	nversParsed cos.Version
+	nversStr    string      // enforce/track software versioning
+	nversParsed cos.Version // ditto
 
-	flags cos.BitFlags // nsi.Flags snapshot, taken after flag resolution
+	flags        cos.BitFlags // nsi.Flags snapshot, taken after flag resolution
+	joinVerified bool         // when joining node has been already verified
 }
 
 // +gen:endpoint POST /v1/cluster/{operation}
@@ -103,6 +106,10 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) 
 	if c.decode(isPub) {
 		return
 	}
+	if err := c.verify(); err != nil {
+		p.writeErr(w, r, err)
+		return
+	}
 	if c.validate() {
 		return
 	}
@@ -119,7 +126,7 @@ func (p *proxy) httpclupost(w http.ResponseWriter, r *http.Request, isPub bool) 
 
 	c.msg = &apc.ActMsg{Action: c.action, Name: c.nsi.ID()}
 
-	// fast path: quick admission during cluster startup/restart // TODO: extra-checks for security
+	// fast path: quick admission during cluster startup/restart
 	p.owner.smap.mu.Lock()
 	msync, added, err := c._joinKalive()
 	p.owner.smap.mu.Unlock()
@@ -191,7 +198,14 @@ func (c *clupost) decode(isPub bool) (stop bool) {
 	p, w, r := c.p, c.w, c.r
 	switch c.apiOp {
 	case apc.Keepalive:
-		if cmn.ReadJSON(w, r, &c.regReq) != nil {
+		body, err := cmn.ReadBytes(r)
+		if err != nil {
+			p.writeErr(w, r, err)
+			return true
+		}
+		c.body = body
+		if err := jsoniter.Unmarshal(body, &c.regReq); err != nil {
+			cmn.WriteErrJSON(w, r, &c.regReq, err)
 			return true
 		}
 		c.nsi = c.regReq.SI
@@ -213,7 +227,14 @@ func (c *clupost) decode(isPub bool) (stop bool) {
 		// NOTE: node ID and 3-networks configuration is obtained from the node itself
 		*c.nsi = *si
 	case apc.SelfJoin: // (auto-join at node startup)
-		if cmn.ReadJSON(w, r, &c.regReq) != nil {
+		body, err := cmn.ReadBytes(r)
+		if err != nil {
+			p.writeErr(w, r, err)
+			return true
+		}
+		c.body = body
+		if err := jsoniter.Unmarshal(body, &c.regReq); err != nil {
+			cmn.WriteErrJSON(w, r, &c.regReq, err)
 			return true
 		}
 		// NOTE: ditto
@@ -223,6 +244,30 @@ func (c *clupost) decode(isPub bool) (stop bool) {
 		return true
 	}
 	return false
+}
+
+func (c *clupost) verify() error {
+	switch c.apiOp {
+	case apc.SelfJoin: // TODO: support admin-join as well
+		return c._verify()
+	case apc.Keepalive:
+		if c.regReq.Flags.IsSet(cos.NodeRestarted) { // TODO: handle `resumeReb` cos.RebalanceInterrupted mutation
+			return c._verify()
+		}
+	}
+	return nil
+}
+
+func (c *clupost) _verify() error {
+	if len(c.p.joinSecret) == 0 || c.joinVerified {
+		return nil
+	}
+	maxSkew := c.config.Auth.NodeJoinNonceWindow()
+	if err := verifyNodeJoin(nodeJoinRequestHMACDomain, c.p.joinSecret, c.body, c.r.Header, maxSkew); err != nil {
+		return cmn.NewErrHTTP(c.r, err, http.StatusUnauthorized)
+	}
+	c.joinVerified = true
+	return nil
 }
 
 func (c *clupost) setActionCheckVer() (stop bool) {
@@ -403,7 +448,12 @@ func (c *clupost) resumeReb() (stop bool) {
 func (c *clupost) dispatch(msync bool) {
 	p, w, r := c.p, c.w, c.r
 	if !msync {
-		if c.apiOp == apc.AdminJoin {
+		switch c.apiOp {
+		case apc.SelfJoin:
+			if len(c.p.joinSecret) > 0 {
+				c.signJoinResponse(nil)
+			}
+		case apc.AdminJoin:
 			// TODO: respond !updated (NOP)
 			p.writeJSON(w, r, apc.JoinNodeResult{DaemonID: c.nsi.ID()}, "")
 		}
@@ -438,7 +488,7 @@ func (c *clupost) dispatch(msync bool) {
 			return
 		}
 		c.setVerHdr() // primary => node: software-version exchange (case #2)
-		p.writeJSON(w, r, md, path.Join(c.msg.Action, c.nsi.ID()))
+		p.writeJoinJSON(w, r, md, path.Join(c.msg.Action, c.nsi.ID()), nodeJoinResponseHMACDomain)
 	}
 
 	go func() {
@@ -446,6 +496,14 @@ func (c *clupost) dispatch(msync bool) {
 			nlog.Errorf("%s: failed to join %s: %v", p, c.nsi.StringEx(), err)
 		}
 	}()
+}
+
+func (c *clupost) signJoinResponse(body []byte) {
+	debug.Assert(len(c.p.joinSecret) > 0) // bootstrap loaded the configured secret
+	debug.Assert(c.apiOp == apc.SelfJoin) // only self-join responses use this proof
+
+	// An empty body authenticates a successful no-op self-join response.
+	signNodeJoin(nodeJoinResponseHMACDomain, c.p.joinSecret, body, c.w.Header())
 }
 
 // primary => node: stamp the response with our software version (see version-boundary enforcement)
@@ -462,6 +520,7 @@ func (c *clupost) adminJoinHandshake() (int, error) {
 		return http.StatusInternalServerError, err
 	}
 	nlog.Infof("%s: %s %s => (%s)", p, c.apiOp, nsi.StringEx(), p.owner.smap.get().StringEx())
+	// TODO: authenticate admin-join with node_join_secret_path before exchanging cluster metadata.
 
 	cargs := allocCargs()
 	{
@@ -571,6 +630,12 @@ func (c *clupost) _joinKalive() (msync, added bool, _ error) {
 	if !smap.isPrimary(p.si) {
 		return false, false, newErrNotPrimary(p.si, smap, "cannot "+apiOp+" "+nsi.StringEx())
 	}
+	if apiOp == apc.SelfJoin {
+		// Self-join is an explicit admission request, authentication is required
+		if err := c._verify(); err != nil {
+			return false, false, err
+		}
+	}
 
 	var (
 		keepalive = apiOp == apc.Keepalive
@@ -578,6 +643,10 @@ func (c *clupost) _joinKalive() (msync, added bool, _ error) {
 	)
 	if osi == nil {
 		if keepalive {
+			// Keepalive becomes admission only when the node is absent from Smap, authentication is required
+			if err := c._verify(); err != nil {
+				return false, false, err
+			}
 			if err := checkNodeVer(p.String(), c.nsi.StringEx(), c.nversStr); err != nil {
 				return false, false, err
 			}
