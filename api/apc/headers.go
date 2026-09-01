@@ -113,9 +113,6 @@ const (
 	HdrSenderIsPrimary = aisPrefix + "Caller-Is-Primary"
 	HdrSenderSmapVer   = aisPrefix + "Caller-Smap-Ver"
 
-	// TODO: remove in v5.1
-	HdrT2TPutterID = aisPrefix + "Putter-Id"
-
 	HdrXactionID = aisPrefix + "Xaction-Id"
 
 	// intra-cluster streams
@@ -158,7 +155,7 @@ const lais = len(aisPrefix)
 // - target InitObjProps2Hdr
 // - api/object
 func PropToHeader(prop string) string {
-	debug.Assert(!strings.HasPrefix(prop, aisPrefix), "already converted: ", prop)
+	debug.AssertFunc(func() bool { return !strings.HasPrefix(prop, aisPrefix) }, "already converted: ", prop)
 	if prop[0] == '.' || prop[0] == '_' {
 		prop = prop[1:]
 	}

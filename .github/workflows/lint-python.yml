@@ -19,7 +19,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      # pylint/astroid (see python/aistore/lint_requirements) require Python >= 3.10.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
       - name: Lint python
+        env:
+          # GitHub's runners can report a cgroup CPU quota of 1, which makes
+          # pylint's jobs=0 auto-detect fall back to single-process mode and
+          # hit a spurious astroid inference error
+          # Force >=2 workers here only; GitLab CI and local runs keep auto-detect.
+          PYLINT_JOBS: 2
         run: |
-          python -m pip install pylint
           make lint-python

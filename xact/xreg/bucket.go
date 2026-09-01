@@ -22,7 +22,7 @@ import (
 func RegBckXact(entry Renewable) { dreg.regBckXact(entry) }
 
 func (r *registry) regBckXact(entry Renewable) {
-	debug.Assert(xact.IsSameScope(entry.Kind(), xact.ScopeB, xact.ScopeGB))
+	debug.AssertFunc(func() bool { return xact.IsSameScope(entry.Kind(), xact.ScopeB, xact.ScopeGB) })
 	r.bckXacts[entry.Kind()] = entry // no locking: all reg-s are done at init time
 }
 
@@ -47,7 +47,7 @@ func RenewMakeNCopies(uuid, tag string) {
 	bmd.Range(&provider, nil, func(bck *meta.Bck) bool {
 		if bck.Props.Mirror.Enabled {
 			rns := RenewBckMakeNCopies(bck, uuid, tag, int(bck.Props.Mirror.Copies))
-			if rns.Err == nil && !rns.IsRunning() {
+			if rns.IsNew() {
 				xact.GoRunW(rns.Entry.Get())
 			}
 		}
@@ -59,7 +59,7 @@ func RenewMakeNCopies(uuid, tag string) {
 		bmd.Range(&name, &ns, func(bck *meta.Bck) bool {
 			if bck.Props.Mirror.Enabled {
 				rns := RenewBckMakeNCopies(bck, uuid, tag, int(bck.Props.Mirror.Copies))
-				if rns.Err == nil && !rns.IsRunning() {
+				if rns.IsNew() {
 					xact.GoRunW(rns.Entry.Get())
 				}
 			}

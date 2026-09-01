@@ -174,15 +174,15 @@ func (p *proxy) _lsofc(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (lsofcRes,
 }
 
 func (p *proxy) _lsofcRemote(bck *meta.Bck, lsmsg *apc.LsoMsg, smap *smapX) (fc lsofcRes, err error) {
-	debug.Assert(bck.IsRemote())
-	debug.Assert(!lsmsg.IsFlagSet(apc.LsCached))
+	debug.AssertFunc(func() bool { return bck.IsRemote() })
+	debug.AssertFunc(func() bool { return !lsmsg.IsFlagSet(apc.LsCached) })
 
 	fc.listRemote = true
 
 	// remote bucket outside cluster (not in BMD) that hasn't been added ("on the fly") by the caller
 	// (lsmsg flag below)
 	if bck.Props.BID == 0 {
-		debug.Assert(lsmsg.IsFlagSet(apc.LsDontAddRemote))
+		debug.AssertFunc(func() bool { return lsmsg.IsFlagSet(apc.LsDontAddRemote) })
 		fc.wantOnlyRemote = true
 		if !lsmsg.WantOnlyRemoteProps() {
 			err := fmt.Errorf("cannot list remote and not-in-cluster bucket %s for not-only-remote object properties: %q",
@@ -239,6 +239,12 @@ func (p *proxy) lsObjsA(bck *meta.Bck, lsmsg *apc.LsoMsg, hdr http.Header, smap 
 	if lsmsg.PageSize == 0 && !isNBI {
 		lsmsg.PageSize = apc.MaxPageSizeAIS
 	}
+
+	// TODO: an exact page-size boundary (returned entries == PageSize) is reported as
+	// truncated even when there's nothing left to list. Proper fix: have each target
+	// report whether it has more to list (a separate response field/flag) instead of
+	// the proxy inferring it client-side from entry counts. This touches the target-side
+	// listing API, left for a follow-up commit.
 
 	actMsgExt = p.newAmsgActVal(apc.ActList, &lsmsg)
 	args = allocBcArgs()

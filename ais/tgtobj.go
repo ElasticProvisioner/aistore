@@ -185,7 +185,7 @@ func (poi *putOI) chunk(chunkSize int64) (ecode int, err error) {
 		uploadID string
 	)
 
-	debug.Assertf(poi.size > 0, "poi.size is required in chunk, object name: %s", poi.lom.Cname())
+	debug.Func(func() { debug.Assertf(poi.size > 0, "poi.size is required in chunk, object name: %s", poi.lom.Cname()) })
 	if uploadID, err = poi.t.ups.start(poi.oreq, lom, poi.skipBackend); err != nil {
 		poi.t.ups.abort(poi.oreq, lom, uploadID)
 		return http.StatusInternalServerError, err
@@ -294,7 +294,7 @@ func (poi *putOI) putObject() (ecode int, err error) {
 		}
 	} else if !poi.t2t && poi.owt == cmn.OwtPut && poi.restful {
 		// user PUT
-		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime)
+		debug.AssertFunc(func() bool { return cos.IsValidAtime(poi.atime) }, poi.atime)
 		poi.stats()
 		// response header
 		if poi.resphdr != nil {
@@ -350,7 +350,7 @@ func (poi *putOI) stats() {
 		cos.NamedVal64{Name: stats.PutLatencyTotal, Value: delta, VarLabs: vlabs},
 	)
 	if poi.rltime > 0 {
-		debug.Assert(bck.IsRemote())
+		debug.AssertFunc(func() bool { return bck.IsRemote() })
 		bp := poi.t.Backend(bck)
 		poi.t.statsT.IncWith(bp.MetricName(stats.PutCount), vlabs)
 		poi.t.statsT.AddWith(
@@ -461,7 +461,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 	switch poi.owt {
 	case cmn.OwtGetTryLock, cmn.OwtGetLock, cmn.OwtGet, cmn.OwtChunks:
 		// do nothing: lom is already wlocked
-		debug.Assertf(lom.IsLocked() == apc.LockWrite, "lom %s is not write-locked", lom.Cname())
+		debug.Func(func() { debug.Assertf(lom.IsLocked() == apc.LockWrite, "lom %s is not write-locked", lom.Cname()) })
 	case cmn.OwtGetPrefetchLock:
 		if !lom.TryLock(true) {
 			nlog.Warningln(poi.loghdr(), "is busy")
@@ -469,7 +469,7 @@ func (poi *putOI) fini() (ecode int, err error) {
 		}
 		defer lom.Unlock(true)
 	default:
-		debug.Assert(cos.IsValidAtime(poi.atime), poi.atime) // expecting valid atime
+		debug.AssertFunc(func() bool { return cos.IsValidAtime(poi.atime) }, poi.atime) // expecting valid atime
 		lom.Lock(true)
 		defer lom.Unlock(true)
 		lom.SetAtimeUnix(poi.atime)
@@ -1158,7 +1158,7 @@ func (goi *getOI) txfini() (fqn string, ecode int, err error) {
 	// transmit (range, arch, regular)
 	switch {
 	case goi.ranges.Range != "":
-		debug.Assert(!dpq.isArch())
+		debug.AssertFunc(func() bool { return !dpq.isArch() })
 		rsize := lom.Lsize()
 		if goi.ranges.Size > 0 {
 			rsize = goi.ranges.Size
@@ -1319,6 +1319,9 @@ func (goi *getOI) setwhdr(whdr http.Header, cksum *cos.Cksum, size int64) {
 	} else {
 		cmn.ToHeader(goi.lom.ObjAttrs(), whdr, size, cksum)
 	}
+
+	// when applicable, retire the kTLS-armed connection _after_ this response
+	ktlsTxRetire(goi.req, whdr, size)
 }
 
 // in particular, setup reader and writer and set headers
@@ -1329,7 +1332,9 @@ func (goi *getOI) _txreg(fqn string, lmfh cos.LomReader, whdr http.Header) (err 
 
 	// Tx
 	if goi.canSendfile(lmfh) {
-		err = goi.sendfile(lmfh, fqn, size, false /*committed*/)
+		// NOTE: net.sendFile unwraps io.LimitedReader before the syscall,
+		// so the wrap is free; ktlsTxConn.ReadFrom requires it (see ais/ktls)
+		err = goi.sendfile(&io.LimitedReader{R: lmfh, N: size}, fqn, size, false /*committed*/)
 	} else {
 		buf, slab := goi.t.gmm.AllocSize(min(size, memsys.MaxPageSlabSize))
 		err = goi.transmit(lmfh, buf, fqn, size, false /*committed*/)
@@ -1355,10 +1360,13 @@ func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) erro
 		var (
 			size = csl.Size()
 		)
-		debug.Assert(size >= 0, "negative archive entry size for", lom.Cname(), "/", dpq.arch.path)
+		debug.Func(func() { debug.Assert(size >= 0, "negative archive entry size for", lom.Cname(), "/", dpq.arch.path) })
 		// (compare w/ goi.setwhdr)
 		whdr.Set(cos.HdrContentType, cos.ContentBinary)
 		whdr.Set(cos.HdrContentLength, strconv.FormatInt(size, 10))
+
+		// see also: goi.setwhdr()
+		ktlsTxRetire(goi.req, whdr, size)
 
 		buf, slab := goi.t.gmm.AllocSize(_txsize(size))
 		err = goi.transmit(csl, buf, fqn, size, false /*committed*/)
@@ -1379,6 +1387,10 @@ func (goi *getOI) _txarch(fqn string, lmfh cos.LomReader, whdr http.Header) erro
 	if err != nil {
 		return fmt.Errorf("failed to open %s: %w", lom.Cname(), err)
 	}
+
+	// (compare w/ goi.setwhdr) - size is not known until ReadUntil completes
+	// TODO: might be too conservative for .tar; might be not enough for .tgz et al. compressed
+	ktlsTxRetire(goi.req, whdr, lom.Lsize())
 
 	rcb := _newRcb(goi.w)
 	whdr.Set(cos.HdrContentType, cos.ContentTar)
@@ -1436,7 +1448,10 @@ func (goi *getOI) sendfile(r io.Reader, fqn string, size int64, committed bool) 
 
 // source must be monolithic file-backed (see assert)
 func (goi *getOI) canSendfile(lmfh cos.LomReader) bool {
-	if cmn.Rom.UseHTTPS() || goi.lom.IsChunked() {
+	if goi.lom.IsChunked() {
+		return false
+	}
+	if !canSendfileRequest(goi.req, cmn.Rom.UseHTTPS()) {
 		return false
 	}
 
@@ -1447,6 +1462,11 @@ func (goi *getOI) canSendfile(lmfh cos.LomReader) bool {
 
 	_, ok := goi.w.(io.ReaderFrom)
 	return ok
+}
+
+// TODO: keeping it separate only for unit tests
+func canSendfileRequest(r *http.Request, useHTTPS bool) bool {
+	return !useHTTPS || (r != nil && isKTLSTx(r.Context()))
 }
 
 func (goi *getOI) _txerr(err error, fqn string, written, size int64, committed bool) error {
@@ -2076,7 +2096,7 @@ func (coi *coi) _send(t *target, lom *core.LOM, sargs *sendArgs) (res xs.CoiRes)
 // use data mover to transmit objects to other targets
 // (compare with coi.put())
 func (*coi) _dm(lom *core.LOM, sargs *sendArgs) error {
-	debug.Assert(sargs.dm.OWT() == sargs.owt)
+	debug.AssertFunc(func() bool { return sargs.dm.OWT() == sargs.owt })
 	o := transport.AllocSend()
 	hdr, oa := &o.Hdr, sargs.objAttrs
 	{
@@ -2100,12 +2120,6 @@ func (coi *coi) put(t *target, sargs *sendArgs) error {
 	)
 	cmn.ToHeader(sargs.objAttrs, hdr, size)
 	hdr.Set(cos.HdrContentType, cos.ContentBinary)
-
-	if cmn.IsV50Bridge() {
-		// pre-5.0 receivers reject T2T PUT without it
-		// ("expected to be redirected or replicated")
-		hdr.Set(apc.HdrT2TPutterID, t.SID())
-	}
 
 	query.Set(apc.QparamOWT, sargs.owt.ToS())
 	if coi.Xact != nil {

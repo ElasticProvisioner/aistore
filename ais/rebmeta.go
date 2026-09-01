@@ -185,7 +185,7 @@ func (r *rmdOwner) do(ctx *rmdModifier) (clone *rebMD, err error) {
 	clone = ctx.prev.clone()
 	clone.TargetIDs = nil
 	clone.CluID = r.cluID
-	debug.Assert(cos.IsValidUUID(clone.CluID), clone.CluID)
+	debug.AssertFunc(func() bool { return cos.IsValidUUID(clone.CluID) }, clone.CluID)
 	ctx.pre(ctx, clone) // `pre` callback
 
 	if err = r.persist(clone); err == nil {
@@ -268,9 +268,11 @@ func (m *rmdModifier) listen(cb func(nl nl.Listener)) {
 		// manually add (maintenance => active) targets to notifiers
 		notifiers = m.smapCtx.smap.Tmap.ActiveMap()
 		for _, sid := range m.smapCtx.nodeIDs() {
-			debug.AssertNoErr(cos.ValidateDaemonID(sid))
+			debug.Func(func() { debug.AssertNoErr(cos.ValidateDaemonID(sid)) })
 			si := m.smapCtx.smap.GetNode(sid)
-			debug.Assertf(si != nil, "%s: missing %s in %s", apc.ActStopMaintenance, sid, m.smapCtx.smap.StringEx())
+			debug.Func(func() {
+				debug.Assertf(si != nil, "%s: missing %s in %s", apc.ActStopMaintenance, sid, m.smapCtx.smap.StringEx())
+			})
 			if si != nil && si.IsTarget() {
 				// as far as rebalancing, proxy stop-maintenance is inconsequential
 				tsis = append(tsis, si)
@@ -321,7 +323,7 @@ func (m *rmdModifier) postRm(nl nl.Listener) {
 	)
 	for _, sid := range m.smapCtx.nodeIDs() {
 		si := m.smapCtx.smap.GetNode(sid)
-		debug.Assertf(si != nil, "missing %s in %s", sid, m.smapCtx.smap.StringEx())
+		debug.Func(func() { debug.Assertf(si != nil, "missing %s in %s", sid, m.smapCtx.smap.StringEx()) })
 		if si != nil {
 			nodes = append(nodes, si)
 			snames = append(snames, si.StringEx())
@@ -332,7 +334,7 @@ func (m *rmdModifier) postRm(nl nl.Listener) {
 	} else {
 		warn = fmt.Sprintf("remove %v from the current %s", snames, smap.StringEx())
 	}
-	debug.Assert(nl.UUID() == m.rebID)
+	debug.AssertFunc(func() bool { return nl.UUID() == m.rebID })
 
 	if nl.ErrCnt() == 0 {
 		nlog.Infoln("post-rebalance commit:", warn)
@@ -367,7 +369,7 @@ func (m *rmdModifier) postRm(nl nl.Listener) {
 }
 
 func (m *rmdModifier) log(nl nl.Listener) {
-	debug.Assert(nl.UUID() == m.rebID)
+	debug.AssertFunc(func() bool { return nl.UUID() == m.rebID })
 	var (
 		err  = nl.Err()
 		abrt = nl.IsAborted()
@@ -377,7 +379,7 @@ func (m *rmdModifier) log(nl nl.Listener) {
 	case err == nil && !abrt:
 		nlog.InfoDepth(1, name, "done")
 	case abrt:
-		debug.Assert(err != nil, nl.String()+" - aborted w/ no errors")
+		debug.Func(func() { debug.Assert(err != nil, nl.String()+" - aborted w/ no errors") })
 		nlog.ErrorDepth(1, name, err)
 	default:
 		nlog.ErrorDepth(1, name, "failed:", err)

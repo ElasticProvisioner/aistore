@@ -164,7 +164,7 @@ func (sdm *sharedDM) Open(config *cmn.Config, selected *cmn.XactConf) error {
 	sdm.dm.Open()
 	sdm.ocmu.Unlock()
 
-	debug.Assert(sdm.last.Load() != 0) // touched above
+	debug.AssertFunc(func() bool { return sdm.last.Load() != 0 }) // touched above
 	hk.Reg(sdm.trname()+hk.NameSuffix, sdm.housekeep, sdmPruneIval)
 
 	nlog.InfoDepth(1, core.T.String(), "open", sdm.trname())
@@ -294,7 +294,7 @@ func (sdm *sharedDM) RegRecv(rx transport.Receiver) {
 	sdm.ocmu.Lock()
 	sdm.rxmu.Lock()
 
-	debug.Assert(sdm.isOpen(), sdm.trname(), ": RegRecv while closed: ", rx.ID())
+	debug.Func(func() { debug.Assert(sdm.isOpen(), sdm.trname(), ": RegRecv while closed: ", rx.ID()) })
 	if sdm.isOpen() {
 		en := &rxent{rx: rx}
 		sdm.receivers[rx.ID()] = en

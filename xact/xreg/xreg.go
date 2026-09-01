@@ -6,6 +6,7 @@ package xreg
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -37,8 +38,10 @@ import (
 */
 
 const (
-	initialCap       = 256  // initial capacity
-	keepOldThreshold = 1024 // keep so many
+	initialCap         = 256  // initial capacity ('all')
+	initialCapActive   = 128  // ditto ('active')
+	initialCapROActive = 192  // ditto ('roActive')
+	keepOldThreshold   = 1024 // keep so many
 
 	waitPrevAborted = 2 * time.Second
 	waitLimitedCoex = 5 * time.Second
@@ -70,7 +73,7 @@ type (
 		//
 		// A successful renewal that creates a new entry returns before its Run goroutine is
 		// started. The renewal caller must start that entry (e.g., via xact.GoRunW). Existing entries
-		// returned by renewal must not be started again (see rns.IsRunning).
+		// returned by renewal must not be started again (see rns.IsNew).
 
 		Start() error
 	}
@@ -112,8 +115,9 @@ type (
 
 	entries struct {
 		active   []Renewable // running entries - finished entries are gradually removed
-		roActive []Renewable // read-only copy
-		all      []Renewable
+		roActive []Renewable // read-only copy; reused by the single `periodic` caller (see getAllRunning)
+		all      []Renewable // history
+		skipped  []Renewable // subset of `active`, disjoint from `all` (history cap)
 		mtx      sync.RWMutex
 	}
 	// All entries in the registry. The entries are periodically cleaned up
@@ -146,8 +150,8 @@ func newRegistry() (r *registry) {
 	return &registry{
 		entries: entries{
 			all:      make([]Renewable, 0, initialCap),
-			active:   make([]Renewable, 0, 128),
-			roActive: make([]Renewable, 0, 192),
+			active:   make([]Renewable, 0, initialCapActive),
+			roActive: make([]Renewable, 0, initialCapROActive),
 		},
 		bckXacts:    make(map[string]Renewable, 32),
 		nonbckXacts: make(map[string]Renewable, 32),
@@ -170,8 +174,8 @@ func (r *registry) getXact(uuid string) (xctn core.Xact, _ error) {
 	e.mtx.RLock()
 outer:
 	for _, entries := range [][]Renewable{e.active, e.all} { // tradeoff: fewer active, higher priority
-		for _, entry := range entries {
-			x := entry.Get()
+		for i := len(entries) - 1; i >= 0; i-- {
+			x := entries[i].Get()
 			if x != nil && x.ID() == uuid {
 				xctn = x
 				break outer
@@ -191,8 +195,8 @@ func GetActiveXact(uuid string) (xctn core.Xact) {
 }
 
 func (e *entries) getActiveXact(uuid string) core.Xact {
-	for _, entry := range e.active {
-		if x := entry.Get(); x.ID() == uuid {
+	for i := len(e.active) - 1; i >= 0; i-- {
+		if x := e.active[i].Get(); x.ID() == uuid {
 			return x
 		}
 	}
@@ -217,9 +221,9 @@ func (e *entries) getAllRunning(inout *core.AllRunningInOut, periodic bool) {
 	if periodic && cap(e.roActive) >= l { // reuse existing
 		roActive = e.roActive
 		roActive = roActive[:l]
-	} else { // allocate
+	} else {
+		// (private here - `e.roActive` is written under the write lock only: see `_add` and `shrinkAll`)
 		roActive = make([]Renewable, l)
-		e.roActive = roActive // reuse later
 	}
 	copy(roActive, e.active)
 	e.mtx.RUnlock()
@@ -298,12 +302,14 @@ func DoAbort(flt *Flt, err error) {
 		if xctn == nil || errV != nil {
 			return
 		}
-		debug.Assertf(flt.Kind == "" || xctn.Kind() == flt.Kind, "wrong xaction kind: %s vs %q", xctn.Cname(), flt.Kind)
+		debug.Func(func() {
+			debug.Assertf(flt.Kind == "" || xctn.Kind() == flt.Kind, "wrong xaction kind: %s vs %q", xctn.Cname(), flt.Kind)
+		})
 		xctn.Abort(err)
 	case flt.Kind != "" && flt.Bck != nil:
 		dreg.abort(&abortArgs{kind: flt.Kind, bcks: []*meta.Bck{flt.Bck}, err: err})
 	case flt.Kind != "":
-		debug.Assert(xact.IsValidKind(flt.Kind), flt.Kind)
+		debug.AssertFunc(func() bool { return xact.IsValidKind(flt.Kind) }, flt.Kind)
 		AbortKind(err, flt.Kind)
 	case flt.Bck != nil:
 		AbortAllBuckets(err, flt.Bck)
@@ -422,17 +428,27 @@ func (args *abortArgs) do(entry Renewable) bool {
 }
 
 func (r *registry) matchingXactsStats(match func(xctn core.Xact) bool) []*core.Snap {
-	matchingEntries := make([]Renewable, 0, 20)
-	r.entries.forEach(func(entry Renewable) bool {
-		if !match(entry.Get()) {
-			return true
+	e := &r.entries
+
+	e.mtx.RLock()
+	matching := make([]Renewable, 0, 32)
+	for _, entry := range e.all {
+		if xctn := entry.Get(); xctn != nil && match(xctn) {
+			matching = append(matching, entry)
 		}
-		matchingEntries = append(matchingEntries, entry)
-		return true
-	})
-	// TODO: we cannot do this inside `forEach` because - nested locks
-	sts := make([]*core.Snap, 0, len(matchingEntries))
-	for _, entry := range matchingEntries {
+	}
+	// `e.all` omits currently-running "quiet, brief" xactions once history hits the cap
+	// (see `_add`); `e.skipped` is disjoint from `e.all`, so no deduplication is required
+	for _, entry := range e.skipped {
+		if xctn := entry.Get(); xctn != nil && match(xctn) {
+			matching = append(matching, entry)
+		}
+	}
+	e.mtx.RUnlock()
+
+	// NOTE: Snap() takes locks of its own - must be called with the registry unlocked
+	sts := make([]*core.Snap, 0, len(matching))
+	for _, entry := range matching {
 		if xctn := entry.Get(); xctn != nil {
 			sts = append(sts, xctn.Snap())
 		}
@@ -448,24 +464,15 @@ func (r *registry) hkPruneActive(now int64) time.Duration {
 	}
 	e := &r.entries
 	e.mtx.Lock()
-	l := len(e.active)
-	for i := 0; i < l; i++ {
-		entry := e.active[i]
-		if !entry.Get().IsDone() {
-			continue
-		}
-		copy(e.active[i:], e.active[i+1:])
-		i--
-		l--
-		e.active = e.active[:l]
-	}
+	e.active = slices.DeleteFunc(e.active, func(entry Renewable) bool { return entry.Get().IsDone() })
+	e.skipped = slices.DeleteFunc(e.skipped, func(entry Renewable) bool { return entry.Get().IsDone() })
 	e.mtx.Unlock()
 	return hk.Jitter(hk.Prune2mIval, now)
 }
 
 func (r *registry) hkDelOld(int64) time.Duration {
 	var (
-		toRemove    []string
+		toRemove    []Renewable
 		numKeepMore int
 		now         = time.Now() // need calendar time
 	)
@@ -475,14 +482,15 @@ func (r *registry) hkDelOld(int64) time.Duration {
 
 	// first, cleanup (x-lso, x-moss): walk older to newer while counting the other kinds
 	for i := range l {
-		xctn := r.entries.all[i].Get()
+		entry := r.entries.all[i]
+		xctn := entry.Get()
 		if !xact.Table[xctn.Kind()].QuietBrief {
 			numKeepMore++
 			continue
 		}
 		if xctn.IsDone() {
 			if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeXshort {
-				toRemove = append(toRemove, xctn.ID())
+				toRemove = append(toRemove, entry)
 			}
 		}
 	}
@@ -491,13 +499,14 @@ func (r *registry) hkDelOld(int64) time.Duration {
 	if numKeepMore > keepOldThreshold {
 		var cnt int
 		for i := range l {
-			xctn := r.entries.all[i].Get()
+			entry := r.entries.all[i]
+			xctn := entry.Get()
 			if xact.Table[xctn.Kind()].QuietBrief {
 				continue
 			}
 			if xctn.IsDone() {
 				if sinceFin := now.Sub(xctn.EndTime()); sinceFin >= hk.OldAgeX {
-					toRemove = append(toRemove, xctn.ID())
+					toRemove = append(toRemove, entry)
 					cnt++
 					if numKeepMore-cnt <= keepOldThreshold {
 						break
@@ -506,6 +515,7 @@ func (r *registry) hkDelOld(int64) time.Duration {
 			}
 		}
 	}
+	shrink := r.entries.shrinkable()
 	r.entries.mtx.RUnlock()
 
 	// adaptive HK cadence based on finished-registry backlog
@@ -521,17 +531,19 @@ func (r *registry) hkDelOld(int64) time.Duration {
 		d = max(d>>1, hk.OldAgeXshort)
 	}
 
-	if ll == 0 {
+	if ll == 0 && !shrink {
 		return d
 	}
 
 	// cleanup
 	r.entries.mtx.Lock()
-	for _, id := range toRemove {
-		r.entries.del(id)
-	}
+	r.entries.del(toRemove)
+	r.entries.shrinkAll()
 	r.entries.mtx.Unlock()
 
+	if ll == 0 {
+		return d // shrink-only pass
+	}
 	return hk.Jitter(d, now.UnixNano())
 }
 
@@ -611,53 +623,81 @@ func (e *entries) forEach(matcher func(entry Renewable) bool) {
 	}
 }
 
-// NOTE: is called under lock
-func (e *entries) del(id string) {
-	for idx, entry := range e.all {
-		xctn := entry.Get()
-		if xctn.ID() == id {
-			debug.Assert(xctn.IsDone(), xctn.String(), " aborted: ", xctn.IsAborted())
-			nlen := len(e.all) - 1
-			e.all[idx] = e.all[nlen]
-			e.all = e.all[:nlen]
-			break
-		}
+// remove the specified entries from `all` and `active`; called under lock
+func (e *entries) del(toRemove []Renewable) {
+	if len(toRemove) == 0 {
+		return
 	}
-	for idx, entry := range e.active {
-		xctn := entry.Get()
-		if xctn.ID() == id {
-			if !xctn.IsDone() {
-				nlog.Errorln("Warning: premature HK call to del-old", xctn.String())
-				break
-			}
-			nlen := len(e.active) - 1
-			e.active[idx] = e.active[nlen]
-			e.active = e.active[:nlen]
-			break
+
+	tmp := make(map[Renewable]struct{}, len(toRemove))
+	for _, entry := range toRemove {
+		if debug.ON() {
+			xdel := entry.Get()
+			debug.Assert(xdel.IsDone(), "expected ", xdel.String(), " finished or aborted: ", xdel.IsAborted())
 		}
+		tmp[entry] = struct{}{}
 	}
+
+	// (`slices.DeleteFunc` is order-preserving and zeroes the vacated tail)
+	matches := func(entry Renewable) bool { _, ok := tmp[entry]; return ok }
+	e.all = slices.DeleteFunc(e.all, matches)
+	e.active = slices.DeleteFunc(e.active, matches)
 }
 
-// is called under lock
-// history control for QuietBrief kinds (x-lso, x-moss)
+// shrink only when the excess is large, so that steady-state churn does not re-allocate
+func (e *entries) shrinkAll() {
+	e.all = _shrink(e.all, initialCap)
+
+	e.active = _shrink(e.active, initialCapActive)
+
+	// cached scratch: size against current active, discard stale contents
+	l := len(e.active)
+	if _shrinkable(cap(e.roActive), l, initialCapROActive) {
+		e.roActive = cos.ResetSliceCap(e.roActive[:0], max(initialCapROActive, l+l>>1))
+	}
+
+	e.skipped = _shrink(e.skipped, 0) // no nominal: steady state is empty
+}
+
+// `skipped` and `active` are drained elsewhere and may have nothing left for hkDelOld
+// to remove - ask separately whether there's capacity to hand back; called under rlock
+func (e *entries) shrinkable() bool {
+	return _shrinkable(cap(e.all), len(e.all), initialCap) ||
+		_shrinkable(cap(e.active), len(e.active), initialCapActive) ||
+		_shrinkable(cap(e.roActive), len(e.active), initialCapROActive) ||
+		_shrinkable(cap(e.skipped), len(e.skipped), 0)
+}
+
+func _shrink(s []Renewable, dflt int) []Renewable {
+	if !_shrinkable(cap(s), len(s), dflt) {
+		return s // nothing to reclaim, or still mostly in use
+	}
+	// leave 50% headroom
+	return cos.ResetSliceCap(s, max(dflt, len(s)+len(s)>>1))
+}
+
+func _shrinkable(c, l, dflt int) bool { return c > dflt && c > l<<1 }
+
+// history control for QuietBrief kinds (x-lso, x-moss); called under lock
 // – keep up to 1 024 finished records
-// – anything beyond is silently dropped
+// – anything beyond is excluded from `all` and tracked via `skipped` until completion
 func (e *entries) _add(entry Renewable) {
 	e.active = append(e.active, entry)
+
+	// grow
+	if cap(e.roActive) < len(e.active) {
+		e.roActive = make([]Renewable, 0, len(e.active)+len(e.active)>>1)
+	}
 
 	if l := len(e.all); xact.Table[entry.Kind()].QuietBrief && l >= keepOldThreshold {
 		if n := skipXregHst.Inc(); n%skipXregHstCnt == 1 {
 			nlog.Warningln("num entries in xreg history:", l, "exceeds the cap:", keepOldThreshold,
 				"- not adding:", xact.Cname(entry.Kind(), entry.UUID()))
 		}
+		e.skipped = append(e.skipped, entry)
 		return
 	}
 	e.all = append(e.all, entry)
-
-	// grow
-	if cap(e.roActive) < len(e.active) {
-		e.roActive = make([]Renewable, 0, len(e.active)+len(e.active)>>1)
-	}
 }
 
 // LimitedCoexistence checks whether a given xaction that is about to start can, in fact, "coexist"
@@ -741,7 +781,7 @@ func (r *registry) limco(tsi *meta.Snode, bck *meta.Bck, action string, otherBck
 			continue
 		}
 		d, ok := xact.Table[xctn.Kind()]
-		debug.Assert(ok, xctn.Kind())
+		debug.Func(func() { debug.Assert(ok, xctn.Kind()) })
 		if !d.ConflictRebRes {
 			continue
 		}
@@ -796,6 +836,11 @@ func (rns *RenewRes) IsRunning() bool {
 	return rns.Entry.Get().IsRunning()
 }
 
+// IsNew reports whether renewal successfully registered a new entry.
+func (rns *RenewRes) IsNew() bool {
+	return rns.Err == nil && rns.Entry != nil && rns.UUID == ""
+}
+
 // make sure existing on-demand is active to prevent it from (idle) expiration
 // (see demand.go hkcb())
 func (rns *RenewRes) beingRenewed() {
@@ -822,7 +867,10 @@ func (flt *Flt) String() string {
 }
 
 func (flt *Flt) Matches(xctn core.Xact) (yes bool) {
-	debug.Assert(xact.IsValidKind(xctn.Kind()), xctn.String())
+	kind := xctn.Kind()
+	if debug.ON() {
+		debug.Assert(xact.IsValidKind(kind), xctn.String())
+	}
 	// running?
 	if flt.OnlyRunning != nil {
 		onl := *flt.OnlyRunning
@@ -832,26 +880,33 @@ func (flt *Flt) Matches(xctn core.Xact) (yes bool) {
 	}
 	// same ID?
 	if flt.ID != "" {
-		debug.Assert(cos.IsValidUUID(flt.ID) || xact.IsValidRebID(flt.ID), flt.ID)
+		if debug.ON() {
+			debug.Assert(xact.IsValidUUID(flt.ID), flt.ID)
+		}
 		if yes = xctn.ID() == flt.ID; yes {
-			debug.Assert(xctn.Kind() == flt.Kind, xctn.String()+" vs same ID "+flt.String())
+			if debug.ON() {
+				debug.Assert(flt.Kind == "" || kind == flt.Kind, xctn.String()+" vs same ID "+flt.String())
+			}
 		}
 		return yes
 	}
 	// kind?
 	if flt.Kind != "" {
-		debug.Assert(xact.IsValidKind(flt.Kind), flt.Kind)
-		if xctn.Kind() != flt.Kind {
+		if debug.ON() {
+			debug.Assert(xact.IsValidKind(flt.Kind), flt.Kind)
+		}
+		if kind != flt.Kind {
 			return false
 		}
 	}
 	// bucket?
-	if xact.Table[xctn.Kind()].Scope != xact.ScopeB {
-		return true // non single-bucket x
-	}
+	// (when the filter carries no bucket return early)
 	if flt.Bck == nil {
 		debug.Assert(len(flt.Buckets) == 0)
 		return true // the filter's not filtering out
+	}
+	if xact.Table[kind].Scope != xact.ScopeB {
+		return true // non single-bucket x
 	}
 	if len(flt.Buckets) > 0 {
 		debug.Assert(len(flt.Buckets) == 2)

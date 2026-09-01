@@ -122,7 +122,7 @@ var (
 	flagVersion bool
 	flagQuiet   bool
 
-	etlInitSpec *etl.InitSpecMsg
+	etlInitSpec *etl.ETLSpecMsg
 	etlName     string
 
 	useRandomObjName bool
@@ -512,7 +512,7 @@ Done:
 }
 
 func isDirectS3() bool {
-	debug.Assert(flag.Parsed())
+	debug.AssertFunc(flag.Parsed)
 	return s3Endpoint != ""
 }
 

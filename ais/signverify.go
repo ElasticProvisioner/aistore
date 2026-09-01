@@ -29,9 +29,6 @@ import (
 // via redirect query parameters or control-plane headers. The canonical payload
 // additionally covers the HTTP method, path, and content length.
 //
-// The v5.0 bridge disables sign/verify during rolling upgrades from 4.x;
-// v5.1 will enable this implementation.
-//
 // TODO:
 // - add canonical query/body coverage
 // - enforce startup ordering: restarted node must not originate signed traffic before its new Smap entry gets propagated
@@ -88,7 +85,7 @@ func (svs *svState) init() {
 }
 
 func (svs *svState) set(on bool) {
-	debug.Assert(on == cmn.Rom.SignVerifyEnabled())
+	debug.AssertFunc(func() bool { return on == cmn.Rom.SignVerifyEnabled() })
 
 	cur := svs.cur.Load()
 	if cur.on == on {
@@ -102,7 +99,7 @@ func (svs *svState) set(on bool) {
 }
 
 func (svs *svState) sign() bool {
-	on := cmn.Rom.SignVerifyEnabled() // false on a v5.0 bridge (see cmn.signVerifyEnabled)
+	on := cmn.Rom.SignVerifyEnabled()
 	cur := svs.cur.Load()
 
 	// A note on stateful (config <=> htrun.svs) redundancy:
@@ -134,7 +131,7 @@ func (svs *svState) strict() bool {
 ///////////
 
 func sigLen() int {
-	debug.Assert(base64.RawURLEncoding.EncodedLen(cos.NodeSigningSignatureSize) == 86)
+	debug.AssertFunc(func() bool { return base64.RawURLEncoding.EncodedLen(cos.NodeSigningSignatureSize) == 86 })
 	return 86
 }
 
@@ -205,7 +202,7 @@ func (sv *svReq) verify(sid string, snode *meta.Snode, smap *smapX) (int, error)
 		e := fmt.Errorf(fmtNodeNotPresent, sid, smap)
 		return na, fmt.Errorf("cannot verify request: %v, smapVer=%d", e, sv.smapVer)
 	}
-	debug.Assert(snode.ID() == sid)
+	debug.AssertFunc(func() bool { return snode.ID() == sid })
 
 	if len(snode.VerifyingKey) != cos.NodeSigningPublicKeySize {
 		return na, fmt.Errorf("sender %s: no verifying key", snode.StringEx())
@@ -344,7 +341,7 @@ func _streamPayloadSize(trname, senderID string) int {
 
 func (t *target) streamSign(trname string, sessID int64) (auth transport.Auth) {
 	smap := t.owner.smap.get()
-	debug.Assert(smap.isValid())
+	debug.AssertFunc(func() bool { return smap.isValid() })
 
 	smapVer := smap.version()
 	auth.SmapVer = smapVer
@@ -381,15 +378,15 @@ func (t *target) streamVerify(trname string, sessID int64, senderID string, r *h
 	}
 
 	smap := t.owner.smap.get()
-	debug.Assert(smap.isValid())
+	debug.AssertFunc(func() bool { return smap.isValid() })
 
-	// Sender identity and cluster membership are required even while unsigned
-	// traffic remains permitted during bridge/grace operation.
+	// sender identity and cluster membership are required even while unsigned
+	// traffic remains permitted
 	snode := smap.GetNode(senderID)
 	if snode == nil {
 		return fmt.Errorf(fmtNodeNotPresent, senderID, smap)
 	}
-	debug.Assert(snode.ID() == senderID)
+	debug.AssertFunc(func() bool { return snode.ID() == senderID })
 
 	svgrp, err := svgrpFromHdr(r.Header)
 	if err != nil {

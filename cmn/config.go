@@ -661,7 +661,7 @@ type (
 	// Note: restart required for changes (see ConfigRestartRequired)
 	// ref: docs/networking.md
 	NetConf struct {
-		// layer 4 (read-only)
+		// layer 4
 		L4 L4Conf `json:"l4"`
 
 		HTTP HTTPConf `json:"http"`
@@ -677,16 +677,19 @@ type (
 		UseIPv6 bool `json:"use_ipv6"`
 	}
 	NetConfToSet struct {
+		L4      *L4ConfToSet   `json:"l4,omitempty"`
 		HTTP    *HTTPConfToSet `json:"http,omitempty"`
 		UseIPv6 *bool          `json:"use_ipv6,omitempty"`
 	}
 
 	// L4Conf: transport layer (level 4 in ISO/OSI) configuration.
-	// Read-only.
 	// Applies to both IPv4 and IPv6.
 	L4Conf struct {
-		Proto         string `json:"proto"`           // tcp, udp
-		SndRcvBufSize int    `json:"sndrcv_buf_size"` // SO_RCVBUF and SO_SNDBUF
+		Proto         string `json:"proto"`           // read-only (tcp)
+		SndRcvBufSize int    `json:"sndrcv_buf_size"` // SO_RCVBUF and SO_SNDBUF; see L4Conf.BufSize()
+	}
+	L4ConfToSet struct {
+		SndRcvBufSize *int `json:"sndrcv_buf_size,omitempty"`
 	}
 
 	// TLSConf contains TLS-specific config options.
@@ -1397,7 +1400,7 @@ func (c *Config) TestingEnv() bool {
 
 // [backward compatibility] translate pre-5.0 dotted names
 // (see also: the 4 UnmarshalJSON methods under "AuthConf" below)
-// TODO: remove in 5.1
+// TODO: remove in 5.2 or later
 func _fromLegacyConfName(name string) string {
 	const (
 		oldPrefix = "auth.cluster_key."
@@ -1473,12 +1476,12 @@ func (c *LocalConfig) TestingEnv() bool {
 }
 
 func (c *LocalConfig) AddPath(mpath string) {
-	debug.Assert(!c.TestingEnv())
+	debug.AssertFunc(func() bool { return !c.TestingEnv() })
 	c.FSP.Paths[mpath] = ""
 }
 
 func (c *LocalConfig) DelPath(mpath string) {
-	debug.Assert(!c.TestingEnv())
+	debug.AssertFunc(func() bool { return !c.TestingEnv() })
 	c.FSP.Paths.Delete(mpath)
 }
 
@@ -1656,7 +1659,7 @@ func (c *BackendConf) Validate() (err error) {
 		case apc.AWS, apc.Azure, apc.GCP, apc.OCI:
 			c.setProvider(provider)
 		case "ht":
-			// TODO: remove in 5.1
+			// TODO: remove in 5.2 or later
 			delete(c.Conf, provider)
 			delete(c.Providers, provider)
 		default:
@@ -1667,7 +1670,7 @@ func (c *BackendConf) Validate() (err error) {
 }
 
 func (c *BackendConf) setProvider(provider string) {
-	debug.Assert(apc.IsCloudProvider(provider), provider)
+	debug.AssertFunc(func() bool { return apc.IsCloudProvider(provider) }, provider)
 	if c.Providers == nil {
 		c.Providers = map[string]Ns{}
 	}
@@ -2286,9 +2289,27 @@ func (c *KeepaliveTrackerConf) validate(tag string) error {
 // NetConf and NetConf.HTTPConf
 /////////////
 
+const SndRcvBufAuto = -1
+
+// kernel connection buffer sizing (via setsockopt)
+func (c *L4Conf) BufSize() int {
+	switch c.SndRcvBufSize {
+	case SndRcvBufAuto:
+		return 0 // kernel auto-tuning
+	case 0:
+		return DefaultSndRcvBufferSize // 128K
+	default:
+		return c.SndRcvBufSize
+	}
+}
+
 func (c *NetConf) Validate() (err error) {
 	if c.L4.Proto != "tcp" {
-		return fmt.Errorf("l4 proto %q is not recognized (expecting %s)", c.L4.Proto, "tcp")
+		return fmt.Errorf("l4.proto %q is not recognized (expecting %s)", c.L4.Proto, "tcp")
+	}
+	if size := c.L4.SndRcvBufSize; size < SndRcvBufAuto {
+		return fmt.Errorf("invalid l4.sndrcv_buf_size %d (expecting %d for OS defaults and autotuning, 0 for AIS default, or a positive size)",
+			size, SndRcvBufAuto)
 	}
 	c.HTTP.Proto = "http" // not validating: read-only, and can take only two values
 	if c.HTTP.UseHTTPS {
@@ -2454,7 +2475,7 @@ func (c *FSHCConf) Validate() error {
 // * IntraClusterConf.UnmarshalJSON
 // * IntraClusterConfToSet.UnmarshalJSON (ditto)
 // See related: _fromLegacyConfName()
-// TODO: remove in 5.1
+// TODO: remove in 5.2 or later
 
 func (c *AuthConf) UnmarshalJSON(b []byte) error {
 	type alias AuthConf
@@ -2564,22 +2585,8 @@ func (c *AuthConf) CopyTo(dst *AuthConf) {
 	}
 }
 
-// v5.0 is the bridge release between the v4.x symmetric CSK/HMAC mechanism and
-// v5.1+ per-node Ed25519 signing and node-join security.
-
-// TODO: [backward compatibility] remove in 5.1, along with all call sites
-func IsV50Bridge() bool { return strings.HasPrefix(VersionAIStore, "5.0") }
-
-// Two predicates, two distinct questions. Do not conflate:
-//   - IntraRequestAuthConfigured: what the operator asked for (raw config bit)
-//   - signVerifyEnabled:          what this binary will actually do
-
 func (c *AuthConf) IntraRequestAuthConfigured() bool {
 	return c.IntraCluster != nil && c.IntraCluster.RequestAuth
-}
-
-func (c *AuthConf) signVerifyEnabled() bool {
-	return c.IntraRequestAuthConfigured() && !IsV50Bridge()
 }
 
 // "" implies node-join authentication is not configured; the path is local to
@@ -3647,12 +3654,6 @@ func LoadConfig(globalConfPath, localConfPath, daeRole string, config *Config) e
 	debug.Assert(onSignVerifyToggle == nil, "startup sequence: must not trigger runtime sign/verify hook")
 	Rom.Set(&config.ClusterConfig)
 	Rom.testingEnv = config.TestingEnv()
-
-	// operator messaging (see IsV50Bridge)
-	if IsV50Bridge() && config.Auth.IntraRequestAuthConfigured() {
-		debug.Assert(!Rom.SignVerifyEnabled())
-		nlog.Warningln("auth.intra_cluster.request_auth: configured but disabled in v5.0 bridge")
-	}
 
 	// create dirs
 	if err := cos.CreateDir(config.LogDir); err != nil {

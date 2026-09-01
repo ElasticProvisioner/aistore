@@ -33,6 +33,14 @@ dev_deps:
 botocore_deps:
 	$(PIP) install --upgrade -r aistore/botocore_patch/botocore_requirements $(BOTO_VERSION_ARGS) --quiet
 
+# pylint/astroid need Python >=3.10 and are only needed for linting, so they're
+# kept out of common_requirements - common_deps runs under every supported
+# Python version (3.8+) across the test matrix, and pylint==4.0.7 would break
+# `pip install` outright on 3.8/3.9.
+.PHONY: lint_deps
+lint_deps:
+	$(PIP) install -r aistore/lint_requirements --quiet
+
 .PHONY: s3_test_deps
 s3_test_deps:
 	$(PIP) install --upgrade -r tests/s3compat/requirements.txt --quiet
@@ -111,13 +119,19 @@ python_pytorch_unit_tests: common_deps dev_deps
 python_pytorch_integration_tests: common_deps dev_deps
 	$(PYTEST) -v tests/integration/pytorch
 
+# Optional override for pylint's `jobs` setting (see .pylintrc / .pylintrc-tests
+# for why auto-detect via jobs=0 can misbehave on some CI runners). Leave unset
+# to use the rcfile's own auto-detection.
+PYLINT_JOBS ?=
+PYLINT_JOBS_FLAG = $(if $(PYLINT_JOBS),--jobs=$(PYLINT_JOBS),)
+
 .PHONY: lint
-lint: common_deps botocore_deps mcp_deps
-	pylint --rcfile=.pylintrc --recursive=y aistore
+lint: common_deps botocore_deps mcp_deps lint_deps
+	pylint --rcfile=.pylintrc --recursive=y $(PYLINT_JOBS_FLAG) aistore
 
 .PHONY: lint-tests
-lint-tests: common_deps botocore_deps
-	pylint --rcfile=.pylintrc-tests --recursive=y tests
+lint-tests: common_deps botocore_deps lint_deps
+	pylint --rcfile=.pylintrc-tests --recursive=y $(PYLINT_JOBS_FLAG) tests
 
 # Coverage targets (unit, integration, combined)
 COV_PKG := aistore

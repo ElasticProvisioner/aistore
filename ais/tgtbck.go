@@ -66,8 +66,6 @@ func (t *target) verifyBckVerb(w http.ResponseWriter, r *http.Request, dpq *dpq)
 		}
 	}
 
-	// no IsV50Bridge exemption here (compare w/ _verifyUnsigned) -
-	// bucket verbs arrive exclusively proxy=>target over intra-control via call()
 	if !reqIsIntraCtrl(r) {
 		t.writeErrf(w, r, "invalid bucket request over intra-data network: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
 		return false
@@ -321,7 +319,7 @@ func (t *target) listBuckets(w http.ResponseWriter, r *http.Request, qbck *cmn.Q
 
 func (t *target) blist(qbck *cmn.QueryBcks, config *cmn.Config) (bcks cmn.Bcks, ecode int, err error) {
 	// validate
-	debug.Assert(!qbck.IsAIS())
+	debug.AssertFunc(func() bool { return !qbck.IsAIS() })
 	if qbck.IsCloud() { // must be configured
 		if config.Backend.Get(qbck.Provider) == nil {
 			return nil, 0, &cmn.ErrMissingBackend{Provider: qbck.Provider}
@@ -422,7 +420,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 			return false
 		}
 		xctn := rns.Entry.Get()
-		if !rns.IsRunning() {
+		if rns.IsNew() {
 			xact.GoRunW(xctn)
 		}
 		xls = xctn.(*xs.LsoXact)
@@ -464,7 +462,7 @@ func (t *target) listObjects(w http.ResponseWriter, r *http.Request, bck *meta.B
 // resolve NBI (native bucket inventory) name: locate-and-set when not provided,
 // validate when provided
 func (t *target) _resolveInvName(w http.ResponseWriter, r *http.Request, bck *meta.Bck, lsmsg *apc.LsoMsg) bool /*ok*/ {
-	debug.AssertNoErr(lsmsg.ValidateNBI()) // checked by proxy
+	debug.Func(func() { debug.AssertNoErr(lsmsg.ValidateNBI()) }) // checked by proxy
 
 	if invName := r.Header.Get(apc.HdrInvName); invName == "" {
 		// must exist and be single
@@ -503,7 +501,7 @@ func (t *target) bckSumm(w http.ResponseWriter, r *http.Request, phase string, b
 		}
 
 		xctn := rns.Entry.Get()
-		if !rns.IsRunning() {
+		if rns.IsNew() {
 			xact.GoRunW(xctn)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -553,7 +551,7 @@ func (t *target) shardSumm(w http.ResponseWriter, r *http.Request, phase string,
 		}
 
 		xctn := rns.Entry.Get()
-		if !rns.IsRunning() {
+		if rns.IsNew() {
 			xact.GoRunW(xctn)
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -574,7 +572,7 @@ func (t *target) shardSumm(w http.ResponseWriter, r *http.Request, phase string,
 
 	xsumm, ok := xctn.(*xs.XactShardSumm)
 	if !ok {
-		debug.Assert(false, "expected xs.XactShardSumm, got", xctn.String())
+		debug.Func(func() { debug.Assert(false, "expected xs.XactShardSumm, got", xctn.String()) })
 		err := cos.NewErrNotFound(t, apc.ActSummaryShard+" job "+msg.UUID)
 		t._erris(w, r, err, http.StatusNotFound, dpq.silent)
 		return
@@ -650,7 +648,7 @@ func (t *target) httpbckdelete(w http.ResponseWriter, r *http.Request, apireq *a
 
 		// start and immdiately finish xaction with a singular purpose:
 		// to have a record in xreg (via `ais show job`): name and timestamp only
-		debug.Assert(strings.HasPrefix(xid, xact.PrefixEvictKeepID), xid)
+		debug.AssertFunc(func() bool { return strings.HasPrefix(xid, xact.PrefixEvictKeepID) }, xid)
 		_ = xreg.RenewEvictDelete(xid, apc.ActEvictRemoteBck, bck, nil)
 
 		core.LcacheClearBcks(wg, bck)
@@ -862,7 +860,7 @@ func (t *target) _bckhead(w http.ResponseWriter, r *http.Request, apireq *apiReq
 		nlog.Infoln(r.Method, bck, "<=", pid)
 	}
 
-	debug.Assert(!bck.IsAIS())
+	debug.AssertFunc(func() bool { return !bck.IsAIS() })
 
 	// + cloud
 	bp := t.Backend(bck)

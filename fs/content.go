@@ -124,7 +124,7 @@ func (csm *contentSpecMgr) _reg(cttype string, cr contentRes) {
 		panic(fmt.Errorf("%s: %s %q must have length %d", csmtag, cttag, cttype, contentTypeLen))
 	}
 	if _, ok := csm.m[cttype]; ok {
-		debug.AssertNoErr(fmt.Errorf("%s: %s %q is already registered", csmtag, cttag, cttype))
+		debug.Func(func() { debug.AssertNoErr(fmt.Errorf("%s: %s %q is already registered", csmtag, cttag, cttype)) })
 	}
 	csm.m[cttype] = cr
 }
@@ -229,7 +229,7 @@ func (*workCR) parseUbase(base string) (ci ContentInfo) {
 
 func (*objChunkCR) makeUbase(base string, extras ...string) string {
 	debug.Assert(len(extras) == 2, "expecting uploadID and chunk number, got: ", extras)
-	debug.Assert(cos.ValidateManifestID(extras[0]) == nil, "uploadID must be valid")
+	debug.AssertFunc(func() bool { return cos.ValidateManifestID(extras[0]) == nil }, "uploadID must be valid")
 	debug.Assert(extras[1] != "", "chunk number must be non-empty")
 	return base + ssepa + extras[0] + ssepa + extras[1]
 }
@@ -263,7 +263,7 @@ func (*chunkMetaCR) makeUbase(base string, extras ...string) string {
 		return base // completed
 	}
 	debug.Assert(len(extras) == 1, extras)
-	debug.Assert(cos.ValidateManifestID(extras[0]) == nil, "uploadID must be valid")
+	debug.AssertFunc(func() bool { return cos.ValidateManifestID(extras[0]) == nil }, "uploadID must be valid")
 	return base + ssepa + extras[0] // partial (with uploadID)
 }
 

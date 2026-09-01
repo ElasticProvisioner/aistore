@@ -59,7 +59,7 @@ var _ streamer = (*Stream)(nil)
 // and returns the effective error after considering any prior termination.
 func (s *Stream) terminate(err error) (actErr error) {
 	ok := s.term.done.CAS(false, true)
-	debug.Assert(ok, s.String())
+	debug.Func(func() { debug.Assert(ok, s.String()) })
 
 	s.term.mu.Lock()
 	if s.term.err == nil {
@@ -327,7 +327,7 @@ func (s *Stream) eoObj(err error) {
 	}
 
 	// stream Tx stats: data only
-	debug.Assert(!obj.Hdr.IsControl() || (objSize == 0 && obj.Hdr.ObjAttrs.Size == 0))
+	debug.AssertFunc(func() bool { return !obj.Hdr.IsControl() || (objSize == 0 && obj.Hdr.ObjAttrs.Size == 0) })
 	if !obj.Hdr.IsControl() {
 		g.tstats.Inc(cos.StreamsOutObjCount)
 		g.tstats.Add(cos.StreamsOutObjSize, objSize) // actual size

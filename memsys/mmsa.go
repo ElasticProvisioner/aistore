@@ -115,7 +115,7 @@ const NumStats = NumPageSlabs // NOTE: must be >= NumSmallSlabs
 const (
 	optDepth = 128  // ring "depth", i.e., num free bufs we trend to (see grow())
 	minDepth = 4    // depth when idle or under OOM
-	maxDepth = 4096 // exceeding warrants reallocation (see related `clipSGL`)
+	maxDepth = 4096 // exceeding warrants reallocation (see related `maxPooledSGLCap`)
 )
 
 const countThreshold = 16 // exceeding this scatter-gather count warrants selecting a larger-(buffer)-size Slab
@@ -160,6 +160,10 @@ type (
 //////////
 // MMSA //
 //////////
+
+// low watermark: the PressureLow boundary
+// (compare with MinFree - the PressureExtreme floor)
+func (r *MMSA) LowWM() uint64 { return r.lowWM }
 
 func (r *MMSA) String() string {
 	var (

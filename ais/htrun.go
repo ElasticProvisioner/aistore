@@ -421,16 +421,9 @@ func (h *htrun) initPhase1(config *cmn.Config) {
 		nlog.Infof("%s (multihome) access: %v and %v", cmn.NetPublic, pubAddr, h.si.PubExtra)
 	}
 
-	var (
-		ctlbuf int
-		tcpbuf = config.Net.L4.SndRcvBufSize
-	)
-	if h.si.IsProxy() {
-		tcpbuf = 0
-	} else {
-		if tcpbuf == 0 {
-			tcpbuf = cmn.DefaultSndRcvBufferSize // ditto: targets use AIS default when not configured
-		}
+	var ctlbuf, tcpbuf int
+	if !h.si.IsProxy() { // proxies retain OS defaults, regardless of L4 config
+		tcpbuf = config.Net.L4.BufSize()
 		if !config.HostNet.UseIntraData {
 			// collapsed mode: apply target data socket buffer sizing to the shared listener
 			ctlbuf = tcpbuf
@@ -474,7 +467,7 @@ func mustDiffer(ip1 meta.NetInfo, port1 int, use1 bool, ip2 meta.NetInfo, port2 
 // - housekeep: memsys; rate-limit-prune
 func (h *htrun) initPhase2(config *cmn.Config) {
 	debug.Assert(g.netServ.control != nil && g.netServ.data != nil && g.netServ.pub != nil) // (phase1 above)
-	if secretPath := config.Auth.NodeJoinSecretPath(); !cmn.IsV50Bridge() && secretPath != "" {
+	if secretPath := config.Auth.NodeJoinSecretPath(); secretPath != "" {
 		var err error
 		if h.joinSecret, err = loadNodeJoinSecret(secretPath); err != nil {
 			cos.ExitLog(err)
@@ -674,6 +667,7 @@ func (h *htrun) _listen(pubExtra meta.NetInfo, logger *log.Logger, tlsConf *tls.
 		sndRcvBufSize: g.netServ.pub.sndRcvBufSize,
 		useIPv6:       useIPv6, // in fact, expecting the same TCP port _and_ the same IP family as PubNet
 		reqNet:        reqNetPub,
+		ktlsTx:        g.netServ.pub.ktlsTx,
 	}
 	ep := pubExtra.TCPEndpoint()
 	go func() {
@@ -1040,7 +1034,7 @@ func (h *htrun) bcastGroup(args *bcastArgs) sliceResults {
 	if args.network == "" {
 		args.network = cmn.NetIntraControl
 	}
-	debug.Assert(cmn.NetworkIsKnown(args.network))
+	debug.AssertFunc(func() bool { return cmn.NetworkIsKnown(args.network) })
 	if args.timeout == 0 {
 		args.timeout = cmn.Rom.MaxKeepalive()
 	}
@@ -1120,7 +1114,7 @@ func (h *htrun) bcastSelected(bargs *bcastArgs) sliceResults {
 		}
 	}
 	for _, si := range bargs.selected {
-		debug.Assert(si.ID() != h.si.ID())
+		debug.AssertFunc(func() bool { return si.ID() != h.si.ID() })
 		wg.Add(1)
 		go f(si)
 	}
@@ -2236,7 +2230,7 @@ func (h *htrun) join(htext htext, contactURLs []string) (*callResult, error) {
 		_, primaryURL, psi = h._primus(nil, config)
 	)
 	if psi != nil && psi.ID() == h.SID() {
-		debug.Assert(h.si.IsProxy())
+		debug.AssertFunc(func() bool { return h.si.IsProxy() })
 		return nil, fmt.Errorf("%s (self) - not joining, am primary [%q]", h, primaryURL) // (unlikely)
 	}
 
@@ -2393,12 +2387,6 @@ func (h *htrun) regTo(url string, psi *meta.Snode, tout time.Duration, htext hte
 		return res
 	}
 
-	if cmn.IsV50Bridge() && cm.SI.VerifyingKey != nil {
-		// v5.0 bridge: do not publish this node's verifying key
-		si := *h.si
-		si.VerifyingKey = nil
-		cm.SI = &si
-	}
 	if keepalive {
 		path = apc.URLPathCluKalive.S
 	} else {
@@ -2438,7 +2426,7 @@ func (h *htrun) fastKalive(smap *smapX, timeout time.Duration, ecActive bool) (s
 	if nlog.Stopping() {
 		return "", http.Header{}, h.errStopping()
 	}
-	debug.Assert(h.ClusterStarted())
+	debug.AssertFunc(func() bool { return h.ClusterStarted() })
 
 	pid, primaryURL, psi := h._primus(smap, nil)
 

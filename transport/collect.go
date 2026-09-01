@@ -179,7 +179,7 @@ func (gc *collector) apply(c *ctrl) {
 	_, exists := gc.streams[s.sessID]
 
 	if c.add {
-		debug.Assert(!exists, s.String())
+		debug.Func(func() { debug.Assert(!exists, s.String()) })
 		gc.streams[s.sessID] = s
 
 		if gc.none.CAS(true, false) {
@@ -255,7 +255,7 @@ func (gc *collector) do() {
 				delete(gc.streams, sessID)
 				if len(gc.streams) == 0 {
 					gc.ticker.Reset(dfltTickIdle)
-					debug.Assert(!gc.none.Load())
+					debug.AssertFunc(func() bool { return !gc.none.Load() })
 					gc.none.Store(true)
 					nlog.Infoln("none")
 				}

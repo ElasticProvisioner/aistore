@@ -236,7 +236,7 @@ func (dm *DM) Open() {
 // return the version of Smap used to establish this data mover's streams
 // (callers can use it to send xaction control messages to the same set of peers)
 func (dm *DM) Smap() *meta.Smap {
-	debug.Assert(dm.stage.opened.Load(), "must be open")
+	debug.AssertFunc(func() bool { return dm.stage.opened.Load() }, "must be open")
 	return dm.data.streams.Smap()
 }
 
@@ -251,10 +251,10 @@ func (dm *DM) String() string {
 	if dm.data.streams == nil {
 		return "dm-" + s + "no-streams"
 	}
-	if dm.data.streams.UsePDU() {
-		return "dm-pdu-" + s + dm.data.streams.Trname()
+	if dm.data.streams.usePDU() {
+		return "dm-pdu-" + s + dm.data.streams.trname
 	}
-	return "dm-" + s + dm.data.streams.Trname()
+	return "dm-" + s + dm.data.streams.trname
 }
 
 // quiesce *local* Rx

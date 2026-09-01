@@ -62,7 +62,7 @@ var (
 )
 
 func (lom *LOM) NewHandle(loaded bool) (*LomHandle, error) {
-	debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked")
+	debug.Func(func() { debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked") })
 	if !loaded {
 		if err := lom.Load(false /*cache it*/, true); err != nil {
 			return nil, err
@@ -87,7 +87,7 @@ var _ io.ReaderAt = (*os.File)(nil) // sanity (whereby UfestReader is guarded el
 // see also: lom.NewDeferROC()
 // see also: lom.GetROC()
 func (lom *LOM) Open() (lh cos.LomReader, err error) {
-	debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked")
+	debug.Func(func() { debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked") })
 	if lom.IsChunked() {
 		lh, err = lom.NewUfestReader()
 	} else {
@@ -111,7 +111,7 @@ func (lom *LOM) Open() (lh cos.LomReader, err error) {
 //
 
 func (lom *LOM) Create() (cos.LomWriter, error) {
-	debug.Assert(lom.IsLocked() == apc.LockWrite, "must be wlocked: ", lom.Cname())
+	debug.Func(func() { debug.Assert(lom.IsLocked() == apc.LockWrite, "must be wlocked: ", lom.Cname()) })
 	return lom._cf(lom.FQN)
 }
 
@@ -141,7 +141,7 @@ func (lom *LOM) _cf(fqn string) (fh *os.File, err error) {
 			lom.setlmfl(lmflFntl)
 			lom.SetCustomKey(cmn.OrigFntl, saved[0])
 		} else {
-			debug.Assert(!cos.IsErrFntl(err))
+			debug.AssertFunc(func() bool { return !cos.IsErrFntl(err) })
 			lom.PopFntl(saved)
 			lom.DelCustomKey(cmn.OrigFntl)
 		}
@@ -259,7 +259,7 @@ func (lom *LOM) RenameToMain(wfqn string) error {
 		return nil
 	}
 	if errors.Is(err, syscall.ENOTDIR) && lom.Bck().IsRemote() {
-		debug.Assert(cos.IsErrMv(err), err) // cos.Rename() returned cos.ErrMv of the type 2
+		debug.AssertFunc(func() bool { return cos.IsErrMv(err) }, err) // cos.Rename() returned cos.ErrMv of the type 2
 		fdir := filepath.Dir(lom.FQN)
 		found, errV := lom._enotdir(fdir, err)
 		if errV == nil {
@@ -341,7 +341,7 @@ func (lom *LOM) RenameFinalize(wfqn string) error {
 		}
 		return nil
 	}
-	debug.Assert(!cos.IsErrFntl(err))
+	debug.AssertFunc(func() bool { return !cos.IsErrFntl(err) })
 	if len(saved) > 0 {
 		lom.PopFntl(saved) // undo
 	}
@@ -355,7 +355,7 @@ func (lom *LOM) RenameFinalize(wfqn string) error {
 // extract a single file from a (.tar, .tgz or .tar.gz, .zip, .tar.lz4) shard
 // uses the provided `mime` or lom.ObjName to detect formatting (empty = auto-detect)
 func (lom *LOM) NewArchpathReader(lh cos.LomReader, archpath, mime string) (csl cos.ReadCloseSizer, err error) {
-	debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked")
+	debug.Func(func() { debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked") })
 	debug.Assert(archpath != "")
 	if err := cos.ValidateArchpath(archpath); err != nil {
 		return nil, err
@@ -364,7 +364,7 @@ func (lom *LOM) NewArchpathReader(lh cos.LomReader, archpath, mime string) (csl 
 	if err != nil {
 		return nil, err
 	}
-	debug.Assert(mime != "", "unknown MIME for", lom.Cname(), "/", archpath)
+	debug.Func(func() { debug.Assert(mime != "", "unknown MIME for", lom.Cname(), "/", archpath) })
 
 	// Fast path: TAR with a stored shard index — seek directly to the file's
 	// data offset instead of a sequential TAR scan.
@@ -486,7 +486,7 @@ func (lom *LOM) NewSectionHandle(lh cos.LomReader, off, size int64) (cos.ReadOpe
 }
 
 func (lom *LOM) newSection(lh cos.LomReader, off, size int64, own bool) (cos.ReadOpenCloser, error) {
-	debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked")
+	debug.Func(func() { debug.Assert(lom.IsLocked() > apc.LockNone, lom.Cname(), " is not locked") })
 
 	if off < 0 || size < 0 || off > lom.Lsize() || size > lom.Lsize()-off {
 		return nil, io.EOF

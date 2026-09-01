@@ -257,7 +257,7 @@ func (bctx *bctx) initAndTry() (bck *meta.Bck, err error) {
 	// 2. handle two specific errors
 	switch {
 	case cmn.IsErrBckNotFound(err):
-		debug.Assert(bck.IsAIS())
+		debug.AssertFunc(func() bool { return bck.IsAIS() })
 		if !bctx.createAIS {
 			if bctx.perms == apc.AceBckHEAD {
 				p.writeErr(bctx.w, bctx.r, err, ecode, Silent)
@@ -267,14 +267,14 @@ func (bctx *bctx) initAndTry() (bck *meta.Bck, err error) {
 			return nil, err
 		}
 	case cmn.IsErrRemoteBckNotFound(err):
-		debug.Assert(bck.IsRemote())
+		debug.AssertFunc(func() bool { return bck.IsRemote() })
 		// when remote-bucket lookup is not permitted
 		if bctx.dontHeadRemote {
 			p.writeErr(bctx.w, bctx.r, err, ecode, Silent)
 			return nil, err
 		}
 	default:
-		debug.Assertf(false, "%q: unexpected %v(%d)", bctx.bck.String(), err, ecode)
+		debug.Func(func() { debug.Assertf(false, "%q: unexpected %v(%d)", bctx.bck.String(), err, ecode) })
 		p.writeErr(bctx.w, bctx.r, err, ecode)
 		return nil, err
 	}

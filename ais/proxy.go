@@ -99,7 +99,7 @@ var _ cos.Runner = (*proxy)(nil)
 func (*proxy) Name() string { return apc.Proxy } // as cos.Runner
 
 func (p *proxy) primary() *primary {
-	debug.Assert(p.prim != nil, p.String())
+	debug.Func(func() { debug.Assert(p.prim != nil, p.String()) })
 	return p.prim
 }
 
@@ -199,7 +199,7 @@ func readProxyID(config *cmn.Config) (pid string) {
 
 func (p *proxy) pready(smap *smapX, withRR bool /* also check readiness to rebalance */) error {
 	const msg = "%s primary: not ready yet "
-	debug.Assert(smap == nil || smap.IsPrimary(p.si))
+	debug.AssertFunc(func() bool { return smap == nil || smap.IsPrimary(p.si) })
 
 	if !p.ClusterStarted() {
 		return fmt.Errorf(msg+"(cluster is starting up)", p)
@@ -1827,7 +1827,9 @@ func (p *proxy) _bckpost(w http.ResponseWriter, r *http.Request, msg *apc.ActMsg
 		return
 	}
 
-	debug.Assertf(xact.IsValidUUID(xid) || strings.IndexByte(xid, ',') > 0, "%q: %q", msg.Action, xid)
+	debug.Func(func() {
+		debug.Assertf(xact.IsValidUUID(xid) || strings.IndexByte(xid, ',') > 0, "%q: %q", msg.Action, xid)
+	})
 	writeXid(w, xid)
 }
 
@@ -2268,7 +2270,7 @@ func (p *proxy) httpbckhead(w http.ResponseWriter, r *http.Request, apireq *apiR
 	}
 
 	// 2. bucket is remote and does exist
-	debug.Assert(bck.IsRemote(), bck.String())
+	debug.Func(func() { debug.Assert(bck.IsRemote(), bck.String()) })
 	debug.Assert(exists)
 
 	// [filtering] when the bucket that must be present is not
@@ -2586,7 +2588,7 @@ func (p *proxy) _dae(w http.ResponseWriter, r *http.Request, isPub bool) {
 		return
 	}
 
-	debug.Assert(reqIsPub(r) == isPub)
+	debug.AssertFunc(func() bool { return reqIsPub(r) == isPub })
 	if isPub {
 		if err := p.checkAccess(w, r, nil, ace); err != nil {
 			return
@@ -2874,7 +2876,7 @@ func (p *proxy) ensureConfigURLs() (config *globalConfig, err error) {
 // using cmn.NetIntraControl network for all three: PrimaryURL, OriginalURL, and DiscoveryURL
 func (p *proxy) _configURLs(_ *configModifier, clone *globalConfig) (updated bool, _ error) {
 	smap := p.owner.smap.get()
-	debug.Assert(smap.isPrimary(p.si))
+	debug.AssertFunc(func() bool { return smap.isPrimary(p.si) })
 
 	if prim := smap.Primary.URL(cmn.NetIntraControl); clone.Proxy.PrimaryURL != prim {
 		clone.Proxy.PrimaryURL = prim

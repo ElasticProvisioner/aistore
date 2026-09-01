@@ -512,7 +512,7 @@ func (mi *Mountpath) _addEnabled(tid string, avail MPI, config *cmn.Config, bloc
 
 // under lock: clones and adds self to available
 func (mi *Mountpath) _cloneAddEnabled(tid string, config *cmn.Config) (err error) {
-	debug.Assert(!mi.IsAnySet(FlagWaitingDD)) // m.b. new
+	debug.AssertFunc(func() bool { return !mi.IsAnySet(FlagWaitingDD) }) // m.b. new
 	avail, disabled := Get()
 	if _, ok := disabled[mi.Path]; ok {
 		return fmt.Errorf("%s exists and is currently disabled (hint: did you want to enable it?)", mi)
@@ -884,7 +884,7 @@ func Remove(mpath string, cb ...func()) (*Mountpath, error) {
 // begin (disable | detach) transaction: CoW-mark the corresponding mountpath
 func BeginDD(action string, flags uint64, mpath string) (mi *Mountpath, numAvail int, alreadyDD bool, err error) {
 	var cleanMpath string
-	debug.Assert(cos.BitFlags(flags).IsAnySet(cos.BitFlags(FlagWaitingDD)))
+	debug.AssertFunc(func() bool { return cos.BitFlags(flags).IsAnySet(cos.BitFlags(FlagWaitingDD)) })
 	if cleanMpath, err = cmn.ValidateMpath(mpath); err != nil {
 		return
 	}
@@ -988,13 +988,13 @@ func _moveMarkers(avail MPI, from *Mountpath) {
 
 	// `from` path must no longer be in _available_
 	_, ok := avail[from.Path]
-	debug.Assert(!ok, from.String())
+	debug.Func(func() { debug.Assert(!ok, from.String()) })
 
 	// copy + delete
 	for _, mi := range avail {
 		ok = true
 		for _, fi := range finfos {
-			debug.Assert(!fi.IsDir(), fname.MarkersDir+cos.PathSeparator+fi.Name()) // marker is a file
+			debug.Func(func() { debug.Assert(!fi.IsDir(), fname.MarkersDir+cos.PathSeparator+fi.Name()) }) // marker is a file
 			var (
 				fromPath = filepath.Join(from.Path, fname.MarkersDir, fi.Name())
 				toPath   = filepath.Join(mi.Path, fname.MarkersDir, fi.Name())

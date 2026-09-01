@@ -309,6 +309,10 @@ func (t *target) init(config *cmn.Config) {
 	keyPair := t.newKeyPair(tid, apc.Target)
 	t.si.Init(tid, apc.Target, keyPair.VerifyingKey)
 
+	// kTLS TX offload (sendfile over HTTPS)
+	g.netServ.pub.ktlsTx = ktlsTxPlatform &&
+		config.Net.HTTP.UseHTTPS && config.Features.IsSet(feat.SendfileOverHTTPS)
+
 	debug.Assert(t.si.IDDigest != 0)
 	cos.InitShortID(t.si.IDDigest)
 
@@ -843,7 +847,7 @@ func (t *target) checkObjVerb(r *http.Request, dpq *dpq) (ecode int, err error) 
 
 	// 3. signed T2T
 	debug.Assert(net == reqNetCtrl || net == reqNetData)
-	debug.Assert(!hasRedirectMarker(dpq))
+	debug.AssertFunc(func() bool { return !hasRedirectMarker(dpq) })
 
 	return t.checkIntra(r, false /*only primary*/, net)
 }
@@ -878,11 +882,6 @@ func (t *target) _verifyUnsigned(r *http.Request, dpq *dpq, net reqNet) (ecode i
 		return 0, nil // legacy direct read access (GET, HEAD)
 	}
 
-	// intra arrival; v5.0 bridge: 4.x senders don't stamp sender headers
-	if cmn.IsV50Bridge() {
-		return 0, nil
-	}
-
 	// ditto (see above)
 	if ecode, err = t.checkIntra(r, false /*only primary*/, net); err != nil {
 		err = fmt.Errorf(fmtErrInvIntraObj, t.si, r.Method, r.RemoteAddr, err)
@@ -905,7 +904,7 @@ func (t *target) _verifySigned(r *http.Request, dpq *dpq) (ecode int, err error)
 	)
 	// target's Smap is never nil; there _may_ be a very narrow startup window
 	// when it's invalid but then we just fail a signed request (unlikely)
-	debug.Assert(smap.isValid())
+	debug.AssertFunc(func() bool { return smap.isValid() })
 
 	if dpq.sv.sig != "" {
 		svgrp = &dpq.sv
@@ -1005,9 +1004,12 @@ func (t *target) getObject(w http.ResponseWriter, r *http.Request, dpq *dpq, bck
 			Lom:           lom,
 			Msg:           &msg,
 			BlobThreshold: threshold,
-			Parent:        "GET",
+			Parent:        xs.BlobParentGET,
 		}
 		xid, _, err := t.blobdl(args, nil /*oa*/, w.Header())
+		if xs.IsErrBlobDlAdmission(err) {
+			err = cmn.NewErrTooManyRequests(err, http.StatusTooManyRequests)
+		}
 		if err != nil && xid != "" {
 			// (for the same reason as cmn.ErrGetTxBenign)
 			nlog.Warningln("GET", lom.Cname(), "via blob-download["+xid+"]:", err)
@@ -1365,7 +1367,7 @@ func (t *target) httpobjpost(w http.ResponseWriter, r *http.Request, apireq *api
 		args := &core.BlobParams{
 			Lom:    lom, // eventually freed by x-blob
 			Msg:    &blobMsg,
-			Parent: "api-blobdl", // directly via the dedicated object API
+			Parent: xs.BlobParentAPI, // directly via the dedicated object API
 		}
 		if xid, _, err = t.blobdl(args, nil /*oa*/, nil /*object headers*/); xid != "" {
 			debug.AssertNoErr(err)
@@ -1575,7 +1577,7 @@ func (t *target) objHead(r *http.Request, whdr http.Header, dpq *dpq, bck *meta.
 		if err != nil {
 			switch {
 			case ecode == http.StatusTooManyRequests || ecode == http.StatusServiceUnavailable:
-				debug.Assertf(cmn.IsErrTooManyRequests(err), "expecting err-remote-retriable, got %T", err)
+				debug.Func(func() { debug.Assertf(cmn.IsErrTooManyRequests(err), "expecting err-remote-retriable, got %T", err) })
 			case ecode != http.StatusNotFound:
 				err = cmn.NewErrFailedTo(t, "HEAD", lom.Cname(), err)
 			case latest:
@@ -1896,7 +1898,7 @@ func (t *target) delobj(lom *core.LOM, evict bool) (int, error, bool) {
 			}
 			debug.Assert(aisErr == nil) // expecting lom.RemoveObj() to return nil when IsNotExist
 		} else if evict {
-			debug.Assert(lom.Bck().IsRemote())
+			debug.AssertFunc(func() bool { return lom.Bck().IsRemote() })
 			t.statsT.Inc(stats.LruEvictCount)
 			t.statsT.Add(stats.LruEvictSize, size)
 		}
@@ -1967,9 +1969,7 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Hea
 		if params.BlobThreshold > 0 && oa.Size < params.BlobThreshold {
 			return "", nil, nil
 		}
-		// write HTTP headers before starting blob download
-		cmn.ToHeader(oa, whdr, oa.Size)
-		return t._blobdl(params, oa)
+		return t._blobdl(params, oa, whdr)
 	}
 
 	// - try-lock (above) to load, check availability
@@ -2009,14 +2009,12 @@ func (t *target) blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Hea
 		// below threshold, not qualified for blob-download
 		return "", nil, nil
 	}
-	// write HTTP headers before starting blob download
-	cmn.ToHeader(oa, whdr, oa.Size)
 	// handle: (not-present || latest-not-eq)
-	return t._blobdl(params, oa)
+	return t._blobdl(params, oa, whdr)
 }
 
 // returns an empty xid ("") if nothing to do
-func (t *target) _blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs.XactBlobDl, error) {
+func (t *target) _blobdl(params *core.BlobParams, oa *cmn.ObjAttrs, whdr http.Header) (string, *xs.XactBlobDl, error) {
 	xid := cos.GenUUID()
 	rns := xs.RenewBlobDl(xid, params, oa)
 	if rns.Err != nil || rns.IsRunning() { // cmn.IsErrXactUsePrev(rns.Err): single blob-downloader per blob
@@ -2035,6 +2033,9 @@ func (t *target) _blobdl(params *core.BlobParams, oa *cmn.ObjAttrs) (string, *xs
 		return xblob.ID(), xblob, nil
 	}
 	// b) via GET (blocking w/ simultaneous transmission)
+	debug.Func(func() { debug.Assert(whdr != nil) })
+	// Admission succeeded: object size is known and can now be published in response headers.
+	cmn.ToHeader(oa, whdr, oa.Size)
 	xblob.Run(nil)
 	return xblob.ID(), nil, xblob.AbortErr()
 }

@@ -83,7 +83,7 @@ func _allocSGL(isPage bool) (z *SGL) {
 }
 
 const (
-	clipSGL = 1024
+	maxPooledSGLCap = 1024
 )
 
 func _freeSGL(z *SGL, isPage bool) {
@@ -96,7 +96,11 @@ func _freeSGL(z *SGL, isPage bool) {
 		pool = &smPools[idx]
 	}
 	sgl := z.sgl[:0]
-	sgl = cos.ResetSliceCap(sgl, clipSGL) // clip cap
+
+	if cap(sgl) > maxPooledSGLCap {
+		sgl = nil
+	}
+
 	*z = sgl0
 	z.sgl = sgl
 	pool.Put(z)
@@ -384,7 +388,7 @@ func (z *SGL) Free() {
 	s.muput.Lock()
 	for _, buf := range z.sgl {
 		size := cap(buf)
-		debug.Assert(int64(size) == s.Size())
+		debug.AssertFunc(func() bool { return int64(size) == s.Size() })
 		b := buf[:size] // always freeing original (fixed buffer) size
 		debug.DeadBeefLarge(b)
 		s.put = append(s.put, b)

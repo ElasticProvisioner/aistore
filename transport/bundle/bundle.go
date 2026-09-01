@@ -75,6 +75,7 @@ type (
 		lid        string
 		extra      transport.Extra
 		multiplier int // optionally: multiple streams per destination (round-robin a.k.a. `robin`)
+		reopenMu   sync.Mutex
 	}
 
 	Args struct {
@@ -93,9 +94,6 @@ type (
 //
 // public
 //
-
-func (sb *Streams) UsePDU() bool   { return sb.extra.UsePDU() }
-func (sb *Streams) Trname() string { return sb.trname }
 
 func New(cl transport.Client, args Args) (sb *Streams) {
 	if args.Net == "" {
@@ -159,7 +157,7 @@ func (sb *Streams) Close(gracefully bool) {
 // when (nodes == nil) transmit via all established streams in a bundle
 // otherwise, restrict to the specified subset (nodes)
 func (sb *Streams) Send(obj *transport.Obj, roc cos.ReadOpenCloser, nodes ...*meta.Snode) error {
-	debug.Assert(!transport.ReservedOpcode(obj.Hdr.Opcode))
+	debug.AssertFunc(func() bool { return !transport.ReservedOpcode(obj.Hdr.Opcode) })
 	streams := sb.get()
 
 	if err := sb._validate(obj, streams, nodes); err != nil {
@@ -240,11 +238,131 @@ func _doCmpl(obj *transport.Obj, roc cos.ReadOpenCloser, err error) {
 	}
 }
 
-func (sb *Streams) Smap() *meta.Smap { return sb.smap } // TODO -- FIXME: start using
+func (sb *Streams) Smap() *meta.Smap { return sb.smap }
+
+// Stale answers a single question: would `_open` against `curr` produce a different
+// set of peer streams than the one this bundle is holding?
+// Three ways for that to happen:
+//   - membership: a peer appeared, left, or crossed the InMaintPostReb boundary
+//     that `_open` itself uses to decide whether to connect;
+//   - incarnation: a peer is still here, under the same ID, but restarted - its
+//     streams are dead even though the cluster map still "looks" the same.
+//   - endpoint: the URL used by this bundle's network changed.
+//
+// NOTE: not a membership predicate in the `Smap.CheckSameTargets` sense - that one
+// answers a rebalance question and deliberately ignores restarts (see its comment).
+func (sb *Streams) Stale(curr *meta.Smap) bool {
+	if curr == nil || sb.smap == nil {
+		return false
+	}
+	if curr.Version == sb.smap.Version {
+		return false // fast path: same epoch, nothing to walk
+	}
+
+	self := core.T.SID()
+
+	// 1) every peer this bundle holds must still be a peer, and the same one
+	for id, osi := range sb.smap.Tmap {
+		if id == self {
+			continue
+		}
+		nsi := curr.Tmap[id]
+		was, is := !osi.InMaintPostReb(), nsi != nil && !nsi.InMaintPostReb()
+		if was != is {
+			return true // gone, or (un)rebalanced-out
+		}
+		if was && !sameIncarnation(osi, nsi) {
+			return true // restarted
+		}
+		if was && osi.URL(sb.network) != nsi.URL(sb.network) {
+			return true // destination changed
+		}
+	}
+
+	// 2) and no new peer may have appeared
+	for id, nsi := range curr.Tmap {
+		if id == self || nsi.InMaintPostReb() {
+			continue
+		}
+		if _, ok := sb.smap.Tmap[id]; !ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Node signing keypairs are ephemeral (regenerated on every restart, in memory only -
+// see ais/htrun newKeyPair), which makes a changed verifying key the definitive
+// restart signal. This includes an empty => non-empty transition when a pre-5.1 peer
+// restarts into 5.1 during a rolling upgrade (compare w/ clupost.rereg).
+func sameIncarnation(osi, nsi *meta.Snode) bool {
+	return cos.CryptoEqual(osi.VerifyingKey, nsi.VerifyingKey)
+}
+
+// renew stream (or streams) to a given peer in the same Smap "epoch"
+func (sb *Streams) ReopenPeerStream(dstID string) error {
+	sb.reopenMu.Lock()
+	defer sb.reopenMu.Unlock()
+
+	// 1) validate
+	old := sb.get()
+	orobin, ok := old[dstID]
+	if !ok {
+		return &ErrDestinationMissing{sb.String(), dstID, sb.smap.String()}
+	}
+	if len(orobin.stsdest) == 0 {
+		debug.Assert(false) // not expecting
+		return nil
+	}
+	smap := core.T.Sowner().Get()
+	if smap.Version != sb.smap.Version {
+		// to err on the side of caution
+		return fmt.Errorf("%s: reopening individual streams when cluster map changes is not supported yet (%s vs %s)",
+			sb, smap.StringEx(), sb.smap.StringEx())
+	}
+	si := sb.smap.GetNode(dstID)
+	if si == nil {
+		// (unlikely - checked above)
+		return cos.NewErrNotFoundFmt(sb, "destination %q (%s)", dstID, sb.smap.StringEx())
+	}
+
+	dstURL := si.URL(sb.network) + transport.ObjURLPath(sb.trname)
+
+	// 2) build new `robin` (same multiplier; consider setting nrobin.i)
+	nrobin := &robin{stsdest: make(stsdest, len(orobin.stsdest))}
+	config := cmn.GCO.Get()
+	for k := range nrobin.stsdest {
+		extra := sb.extra // by value
+		extra.Config = config
+		ns := transport.NewObjStream(sb.client, dstURL, dstID, &extra)
+		nrobin.stsdest[k] = ns
+	}
+	nbundle := maps.Clone(old)
+	if nbundle == nil {
+		nbundle = make(bundle)
+	}
+	nbundle[dstID] = nrobin
+
+	// 3) switch over
+	sb.streams.Store(&nbundle)
+
+	// 4) stop old streams async
+	for _, os := range orobin.stsdest {
+		if !os.IsTerminated() {
+			os.Stop() // via stopCh
+		}
+	}
+
+	nlog.Infoln(sb.String(), "successfully restablished connectivity to", dstID)
+	return nil
+}
 
 //
 // private methods
 //
+
+func (sb *Streams) usePDU() bool { return sb.extra.UsePDU() }
 
 func (sb *Streams) get() (bun bundle) {
 	optr := sb.streams.Load()
@@ -326,7 +444,7 @@ func (sb *Streams) open() {
 
 	node := smap.GetNode(core.T.SID())
 	if node == nil {
-		debug.Assert(false, core.T.SID())
+		debug.Func(func() { debug.Assert(false, core.T.SID()) })
 		// keep the post-open invariant: sb.streams is non-nil
 		sb.streams.Store(&bundle{})
 		sb.smap = smap
@@ -375,60 +493,6 @@ func (sb *Streams) _open(nbundle bundle, nm meta.NodeMap, smap *meta.Smap) {
 		}
 		nbundle[id] = nrobin
 	}
-}
-
-// renew stream (or streams) to a given peer in the same Smap "epoch"
-func (sb *Streams) ReopenPeerStream(dstID string) error {
-	// 1) validate
-	old := sb.get()
-	orobin, ok := old[dstID]
-	if !ok {
-		return &ErrDestinationMissing{sb.String(), dstID, sb.smap.String()}
-	}
-	if len(orobin.stsdest) == 0 {
-		debug.Assert(false) // not expecting
-		return nil
-	}
-	smap := core.T.Sowner().Get()
-	if smap.Version != sb.smap.Version {
-		// to err on the side of caution
-		return fmt.Errorf("%s: reopening individual streams when cluster map changes is not supported yet (%s vs %s)",
-			sb, smap.StringEx(), sb.smap.StringEx())
-	}
-	si := sb.smap.GetNode(dstID)
-	if si == nil {
-		// (unlikely - checked above)
-		return cos.NewErrNotFoundFmt(sb, "destination %q (%s)", dstID, sb.smap.StringEx())
-	}
-	dstURL := si.URL(sb.network) + transport.ObjURLPath(sb.trname)
-
-	// 2) build new `robin` (same multiplier; consider setting nrobin.i)
-	nrobin := &robin{stsdest: make(stsdest, len(orobin.stsdest))}
-	config := cmn.GCO.Get()
-	for k := range nrobin.stsdest {
-		extra := sb.extra // by value
-		extra.Config = config
-		ns := transport.NewObjStream(sb.client, dstURL, dstID, &extra)
-		nrobin.stsdest[k] = ns
-	}
-	nbundle := maps.Clone(old)
-	if nbundle == nil {
-		nbundle = make(bundle)
-	}
-	nbundle[dstID] = nrobin
-
-	// 3) switch over
-	sb.streams.Store(&nbundle)
-
-	// 4) stop old streams async
-	for _, os := range orobin.stsdest {
-		if !os.IsTerminated() {
-			os.Stop() // via stopCh
-		}
-	}
-
-	nlog.Infoln(sb.String(), "successfully restablished connectivity to", dstID)
-	return nil
 }
 
 ///////////////////////////

@@ -652,7 +652,7 @@ func (p *proxy) _cluConfig(smap *smapX) (config *globalConfig, err error) {
 
 // [cluster startup]: resume rebalance if `interrupted`
 func (p *proxy) resumeReb(smap *smapX, config *cmn.Config) {
-	debug.AssertNoErr(smap.validate())
+	debug.Func(func() { debug.AssertNoErr(smap.validate()) })
 	ver := smap.version()
 
 	// initial quiet time
@@ -672,7 +672,7 @@ until:
 			return
 		}
 		if smap.version() != ver {
-			debug.Assert(smap.version() > ver)
+			debug.AssertFunc(func() bool { return smap.version() > ver })
 			elapsed = 0
 			nojoins = min(nojoins+sleep, config.Timeout.Startup.D())
 			if p.owner.rmd.interrupted.Load() {
@@ -822,7 +822,7 @@ func (p *proxy) discoverMeta(smap *smapX) {
 		config := cmn.GCO.Get()
 		if config.Version < cm.Config.version() {
 			if !cos.IsValidUUID(cm.Config.UUID) {
-				debug.Assert(false, cm.Config.String())
+				debug.Func(func() { debug.Assert(false, cm.Config.String()) })
 				cos.ExitLogf("%s: invalid config UUID: %s", p, cm.Config)
 			}
 			if cos.IsValidUUID(config.UUID) && config.UUID != cm.Config.UUID {
@@ -1186,7 +1186,7 @@ ret:
 			return after.Smap
 		}
 	} else {
-		debug.Assert(before.Smap.version() < after.Smap.version())
+		debug.AssertFunc(func() bool { return before.Smap.version() < after.Smap.version() })
 		nlog.Warningln("before:", before.Smap.StringEx(), "after:", after.Smap.StringEx())
 	}
 

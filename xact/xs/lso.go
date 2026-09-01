@@ -155,7 +155,7 @@ func (p *lsoFactory) Start() error {
 
 	// true iff the bucket was not added - not initialized
 	r.walk.dontPopulate = r.walk.wor && bck.Props == nil
-	debug.Assert(!r.walk.dontPopulate || p.msg.IsFlagSet(apc.LsDontAddRemote))
+	debug.AssertFunc(func() bool { return !r.walk.dontPopulate || p.msg.IsFlagSet(apc.LsDontAddRemote) })
 
 	r.smap = core.T.Sowner().Get()
 	tsi, err := r.smap.HrwTargetTask(r.ID())
@@ -325,7 +325,7 @@ loop:
 
 			// cannot change
 			debug.Assert(r.msg.SID == msg.SID, r.msg.SID, " vs ", msg.SID)
-			debug.Assert(r.walk.wor == msg.WantOnlyRemoteProps(), r.CtlMsg())
+			debug.Func(func() { debug.Assert(r.walk.wor == msg.WantOnlyRemoteProps(), r.CtlMsg()) })
 
 			r.IncPending()
 			resp := r.doPage()
@@ -599,7 +599,7 @@ func (r *LsoXact) nextPageR() (err error) {
 	if r.walk.this {
 		page, err = r.thisPageR(npg)
 	} else {
-		debug.Assert(!r.msg.WantOnlyRemoteProps() && /*same*/ !r.walk.wor)
+		debug.AssertFunc(func() bool { return !r.msg.WantOnlyRemoteProps() && /*same*/ !r.walk.wor })
 		select {
 		case rsp := <-r.remtCh:
 			switch {
@@ -857,7 +857,7 @@ func (r *LsoXact) cb(fqn string, de fs.DirEntry) error {
 
 		// Use trailing slash for directory names to distinguish from files with same name
 		// This ensures lexicographical sorting works correctly: "aaa/bbb" < "aaa/bbb/"
-		debug.Assert(!cos.IsLastB(dirName, filepath.Separator))
+		debug.AssertFunc(func() bool { return !cos.IsLastB(dirName, filepath.Separator) })
 		dirName += cos.PathSeparator
 
 		// Deduplicate: heap output is sorted, so duplicates from different mountpaths are adjacent
